@@ -1712,18 +1712,19 @@ class FluxLoraLoaderMixin(LoraBaseMixin):
                 discard_original_layers=False,
             )
 
-        self.load_lora_into_text_encoder(
-            state_dict,
-            network_alphas=network_alphas,
-            text_encoder=self.text_encoder,
-            prefix=self.text_encoder_name,
-            lora_scale=self.lora_scale,
-            adapter_name=adapter_name,
-            metadata=metadata,
-            _pipeline=self,
-            low_cpu_mem_usage=low_cpu_mem_usage,
-            hotswap=hotswap,
-        )
+        if getattr(self, "text_encoder", None) is not None:
+            self.load_lora_into_text_encoder(
+                state_dict,
+                network_alphas=network_alphas,
+                text_encoder=self.text_encoder,
+                prefix=self.text_encoder_name,
+                lora_scale=self.lora_scale,
+                adapter_name=adapter_name,
+                metadata=metadata,
+                _pipeline=self,
+                low_cpu_mem_usage=low_cpu_mem_usage,
+                hotswap=hotswap,
+            )
 
     @classmethod
     def load_lora_into_transformer(

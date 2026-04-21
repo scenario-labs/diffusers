@@ -2003,7 +2003,9 @@ class FluxLoraLoaderMixin(LoraBaseMixin):
         """
         super().unload_lora_weights()
 
-        transformer = getattr(self, self.transformer_name) if not hasattr(self, "transformer") else self.transformer
+        transformer = getattr(self, self.transformer_name, None) if not hasattr(self, "transformer") else self.transformer
+        if not transformer:
+            return
         if hasattr(transformer, "_transformer_norm_layers") and transformer._transformer_norm_layers:
             transformer.load_state_dict(transformer._transformer_norm_layers, strict=False)
             transformer._transformer_norm_layers = None

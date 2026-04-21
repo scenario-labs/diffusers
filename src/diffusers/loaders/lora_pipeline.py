@@ -5727,15 +5727,17 @@ class Flux2LoraLoaderMixin(LoraBaseMixin):
         if not is_correct_format:
             raise ValueError("Invalid LoRA checkpoint. Make sure all LoRA param names contain `'lora'` substring.")
 
-        self.load_lora_into_transformer(
-            state_dict,
-            transformer=getattr(self, self.transformer_name) if not hasattr(self, "transformer") else self.transformer,
-            adapter_name=adapter_name,
-            metadata=metadata,
-            _pipeline=self,
-            low_cpu_mem_usage=low_cpu_mem_usage,
-            hotswap=hotswap,
-        )
+        transformer = getattr(self, self.transformer_name, None) if not hasattr(self, "transformer") else self.transformer
+        if transformer:
+            self.load_lora_into_transformer(
+                state_dict,
+                transformer=transformer,
+                adapter_name=adapter_name,
+                metadata=metadata,
+                _pipeline=self,
+                low_cpu_mem_usage=low_cpu_mem_usage,
+                hotswap=hotswap,
+            )
 
     @classmethod
     # Copied from diffusers.loaders.lora_pipeline.SD3LoraLoaderMixin.load_lora_into_transformer with SD3Transformer2DModel->CogView4Transformer2DModel

@@ -45,13 +45,16 @@ from .lora_conversion_utils import (
     _convert_hunyuan_video_lora_to_diffusers,
     _convert_kohya_flux2_lora_to_diffusers,
     _convert_kohya_flux_lora_to_diffusers,
+    _convert_lycoris_flux2_lokr_to_diffusers,
     _convert_musubi_wan_lora_to_diffusers,
     _convert_non_diffusers_ace_step_lora_to_diffusers,
     _convert_non_diffusers_anima_lora_to_diffusers,
+    _convert_non_diffusers_flux2_lokr_to_diffusers,
     _convert_non_diffusers_flux2_lora_to_diffusers,
     _convert_non_diffusers_hidream_lora_to_diffusers,
     _convert_non_diffusers_ideogram4_lora_to_diffusers,
     _convert_non_diffusers_krea2_lora_to_diffusers,
+    _convert_non_diffusers_lokr_to_diffusers,
     _convert_non_diffusers_lora_to_diffusers,
     _convert_non_diffusers_ltx2_lora_to_diffusers,
     _convert_non_diffusers_ltxv_lora_to_diffusers,
@@ -208,9 +211,11 @@ class StableDiffusionLoraLoaderMixin(LoraBaseMixin):
         kwargs["return_lora_metadata"] = True
         state_dict, network_alphas, metadata = self.lora_state_dict(pretrained_model_name_or_path_or_dict, **kwargs)
 
-        is_correct_format = all("lora" in key for key in state_dict.keys())
+        is_correct_format = all("lora" in key or "lokr" in key for key in state_dict.keys())
         if not is_correct_format:
-            raise ValueError("Invalid LoRA checkpoint. Make sure all LoRA param names contain `'lora'` substring.")
+            raise ValueError(
+                "Invalid LoRA checkpoint. Make sure all LoRA param names contain the `'lora'` or `'lokr'` substring."
+            )
 
         self.load_lora_into_unet(
             state_dict,
@@ -618,9 +623,11 @@ class StableDiffusionXLLoraLoaderMixin(LoraBaseMixin):
             **kwargs,
         )
 
-        is_correct_format = all("lora" in key for key in state_dict.keys())
+        is_correct_format = all("lora" in key or "lokr" in key for key in state_dict.keys())
         if not is_correct_format:
-            raise ValueError("Invalid LoRA checkpoint. Make sure all LoRA param names contain `'lora'` substring.")
+            raise ValueError(
+                "Invalid LoRA checkpoint. Make sure all LoRA param names contain the `'lora'` or `'lokr'` substring."
+            )
 
         self.load_lora_into_unet(
             state_dict,
@@ -1045,9 +1052,11 @@ class SD3LoraLoaderMixin(LoraBaseMixin):
         kwargs["return_lora_metadata"] = True
         state_dict, metadata = self.lora_state_dict(pretrained_model_name_or_path_or_dict, **kwargs)
 
-        is_correct_format = all("lora" in key for key in state_dict.keys())
+        is_correct_format = all("lora" in key or "lokr" in key for key in state_dict.keys())
         if not is_correct_format:
-            raise ValueError("Invalid LoRA checkpoint. Make sure all LoRA param names contain `'lora'` substring.")
+            raise ValueError(
+                "Invalid LoRA checkpoint. Make sure all LoRA param names contain the `'lora'` or `'lokr'` substring."
+            )
 
         self.load_lora_into_transformer(
             state_dict,
@@ -1330,9 +1339,11 @@ class AuraFlowLoraLoaderMixin(LoraBaseMixin):
         kwargs["return_lora_metadata"] = True
         state_dict, metadata = self.lora_state_dict(pretrained_model_name_or_path_or_dict, **kwargs)
 
-        is_correct_format = all("lora" in key for key in state_dict.keys())
+        is_correct_format = all("lora" in key or "lokr" in key for key in state_dict.keys())
         if not is_correct_format:
-            raise ValueError("Invalid LoRA checkpoint. Make sure all LoRA param names contain `'lora'` substring.")
+            raise ValueError(
+                "Invalid LoRA checkpoint. Make sure all LoRA param names contain the `'lora'` or `'lokr'` substring."
+            )
 
         self.load_lora_into_transformer(
             state_dict,
@@ -2430,9 +2441,11 @@ class CogVideoXLoraLoaderMixin(LoraBaseMixin):
         kwargs["return_lora_metadata"] = True
         state_dict, metadata = self.lora_state_dict(pretrained_model_name_or_path_or_dict, **kwargs)
 
-        is_correct_format = all("lora" in key for key in state_dict.keys())
+        is_correct_format = all("lora" in key or "lokr" in key for key in state_dict.keys())
         if not is_correct_format:
-            raise ValueError("Invalid LoRA checkpoint. Make sure all LoRA param names contain `'lora'` substring.")
+            raise ValueError(
+                "Invalid LoRA checkpoint. Make sure all LoRA param names contain the `'lora'` or `'lokr'` substring."
+            )
 
         self.load_lora_into_transformer(
             state_dict,
@@ -2616,9 +2629,11 @@ class Mochi1LoraLoaderMixin(LoraBaseMixin):
         kwargs["return_lora_metadata"] = True
         state_dict, metadata = self.lora_state_dict(pretrained_model_name_or_path_or_dict, **kwargs)
 
-        is_correct_format = all("lora" in key for key in state_dict.keys())
+        is_correct_format = all("lora" in key or "lokr" in key for key in state_dict.keys())
         if not is_correct_format:
-            raise ValueError("Invalid LoRA checkpoint. Make sure all LoRA param names contain `'lora'` substring.")
+            raise ValueError(
+                "Invalid LoRA checkpoint. Make sure all LoRA param names contain the `'lora'` or `'lokr'` substring."
+            )
 
         self.load_lora_into_transformer(
             state_dict,
@@ -2808,9 +2823,11 @@ class LTXVideoLoraLoaderMixin(LoraBaseMixin):
         kwargs["return_lora_metadata"] = True
         state_dict, metadata = self.lora_state_dict(pretrained_model_name_or_path_or_dict, **kwargs)
 
-        is_correct_format = all("lora" in key for key in state_dict.keys())
+        is_correct_format = all("lora" in key or "lokr" in key for key in state_dict.keys())
         if not is_correct_format:
-            raise ValueError("Invalid LoRA checkpoint. Make sure all LoRA param names contain `'lora'` substring.")
+            raise ValueError(
+                "Invalid LoRA checkpoint. Make sure all LoRA param names contain the `'lora'` or `'lokr'` substring."
+            )
 
         self.load_lora_into_transformer(
             state_dict,
@@ -3006,9 +3023,11 @@ class LTX2LoraLoaderMixin(LoraBaseMixin):
         kwargs["return_lora_metadata"] = True
         state_dict, metadata = self.lora_state_dict(pretrained_model_name_or_path_or_dict, **kwargs)
 
-        is_correct_format = all("lora" in key for key in state_dict.keys())
+        is_correct_format = all("lora" in key or "lokr" in key for key in state_dict.keys())
         if not is_correct_format:
-            raise ValueError("Invalid LoRA checkpoint. Make sure all LoRA param names contain `'lora'` substring.")
+            raise ValueError(
+                "Invalid LoRA checkpoint. Make sure all LoRA param names contain the `'lora'` or `'lokr'` substring."
+            )
 
         transformer_peft_state_dict = {
             k: v for k, v in state_dict.items() if k.startswith(f"{self.transformer_name}.")
@@ -3213,9 +3232,11 @@ class SanaLoraLoaderMixin(LoraBaseMixin):
         kwargs["return_lora_metadata"] = True
         state_dict, metadata = self.lora_state_dict(pretrained_model_name_or_path_or_dict, **kwargs)
 
-        is_correct_format = all("lora" in key for key in state_dict.keys())
+        is_correct_format = all("lora" in key or "lokr" in key for key in state_dict.keys())
         if not is_correct_format:
-            raise ValueError("Invalid LoRA checkpoint. Make sure all LoRA param names contain `'lora'` substring.")
+            raise ValueError(
+                "Invalid LoRA checkpoint. Make sure all LoRA param names contain the `'lora'` or `'lokr'` substring."
+            )
 
         self.load_lora_into_transformer(
             state_dict,
@@ -3403,9 +3424,11 @@ class HeliosLoraLoaderMixin(LoraBaseMixin):
         # First, ensure that the checkpoint is a compatible one and can be successfully loaded.
         kwargs["return_lora_metadata"] = True
         state_dict, metadata = self.lora_state_dict(pretrained_model_name_or_path_or_dict, **kwargs)
-        is_correct_format = all("lora" in key for key in state_dict.keys())
+        is_correct_format = all("lora" in key or "lokr" in key for key in state_dict.keys())
         if not is_correct_format:
-            raise ValueError("Invalid LoRA checkpoint. Make sure all LoRA param names contain `'lora'` substring.")
+            raise ValueError(
+                "Invalid LoRA checkpoint. Make sure all LoRA param names contain the `'lora'` or `'lokr'` substring."
+            )
 
         self.load_lora_into_transformer(
             state_dict,
@@ -3595,9 +3618,11 @@ class HunyuanVideoLoraLoaderMixin(LoraBaseMixin):
         kwargs["return_lora_metadata"] = True
         state_dict, metadata = self.lora_state_dict(pretrained_model_name_or_path_or_dict, **kwargs)
 
-        is_correct_format = all("lora" in key for key in state_dict.keys())
+        is_correct_format = all("lora" in key or "lokr" in key for key in state_dict.keys())
         if not is_correct_format:
-            raise ValueError("Invalid LoRA checkpoint. Make sure all LoRA param names contain `'lora'` substring.")
+            raise ValueError(
+                "Invalid LoRA checkpoint. Make sure all LoRA param names contain the `'lora'` or `'lokr'` substring."
+            )
 
         self.load_lora_into_transformer(
             state_dict,
@@ -3788,9 +3813,11 @@ class Lumina2LoraLoaderMixin(LoraBaseMixin):
         kwargs["return_lora_metadata"] = True
         state_dict, metadata = self.lora_state_dict(pretrained_model_name_or_path_or_dict, **kwargs)
 
-        is_correct_format = all("lora" in key for key in state_dict.keys())
+        is_correct_format = all("lora" in key or "lokr" in key for key in state_dict.keys())
         if not is_correct_format:
-            raise ValueError("Invalid LoRA checkpoint. Make sure all LoRA param names contain `'lora'` substring.")
+            raise ValueError(
+                "Invalid LoRA checkpoint. Make sure all LoRA param names contain the `'lora'` or `'lokr'` substring."
+            )
 
         self.load_lora_into_transformer(
             state_dict,
@@ -3977,9 +4004,11 @@ class KandinskyLoraLoaderMixin(LoraBaseMixin):
         kwargs["return_lora_metadata"] = True
         state_dict, metadata = self.lora_state_dict(pretrained_model_name_or_path_or_dict, **kwargs)
 
-        is_correct_format = all("lora" in key for key in state_dict.keys())
+        is_correct_format = all("lora" in key or "lokr" in key for key in state_dict.keys())
         if not is_correct_format:
-            raise ValueError("Invalid LoRA checkpoint. Make sure all LoRA param names contain `'lora'` substring.")
+            raise ValueError(
+                "Invalid LoRA checkpoint. Make sure all LoRA param names contain the `'lora'` or `'lokr'` substring."
+            )
 
         self.load_lora_into_transformer(
             state_dict,
@@ -4220,9 +4249,11 @@ class WanLoraLoaderMixin(LoraBaseMixin):
             transformer=getattr(self, self.transformer_name) if not hasattr(self, "transformer") else self.transformer,
             state_dict=state_dict,
         )
-        is_correct_format = all("lora" in key for key in state_dict.keys())
+        is_correct_format = all("lora" in key or "lokr" in key for key in state_dict.keys())
         if not is_correct_format:
-            raise ValueError("Invalid LoRA checkpoint. Make sure all LoRA param names contain `'lora'` substring.")
+            raise ValueError(
+                "Invalid LoRA checkpoint. Make sure all LoRA param names contain the `'lora'` or `'lokr'` substring."
+            )
 
         load_into_transformer_2 = kwargs.pop("load_into_transformer_2", False)
         if load_into_transformer_2:
@@ -4486,9 +4517,11 @@ class SkyReelsV2LoraLoaderMixin(LoraBaseMixin):
             transformer=getattr(self, self.transformer_name) if not hasattr(self, "transformer") else self.transformer,
             state_dict=state_dict,
         )
-        is_correct_format = all("lora" in key for key in state_dict.keys())
+        is_correct_format = all("lora" in key or "lokr" in key for key in state_dict.keys())
         if not is_correct_format:
-            raise ValueError("Invalid LoRA checkpoint. Make sure all LoRA param names contain `'lora'` substring.")
+            raise ValueError(
+                "Invalid LoRA checkpoint. Make sure all LoRA param names contain the `'lora'` or `'lokr'` substring."
+            )
 
         load_into_transformer_2 = kwargs.pop("load_into_transformer_2", False)
         if load_into_transformer_2:
@@ -4695,9 +4728,11 @@ class CogView4LoraLoaderMixin(LoraBaseMixin):
         kwargs["return_lora_metadata"] = True
         state_dict, metadata = self.lora_state_dict(pretrained_model_name_or_path_or_dict, **kwargs)
 
-        is_correct_format = all("lora" in key for key in state_dict.keys())
+        is_correct_format = all("lora" in key or "lokr" in key for key in state_dict.keys())
         if not is_correct_format:
-            raise ValueError("Invalid LoRA checkpoint. Make sure all LoRA param names contain `'lora'` substring.")
+            raise ValueError(
+                "Invalid LoRA checkpoint. Make sure all LoRA param names contain the `'lora'` or `'lokr'` substring."
+            )
 
         self.load_lora_into_transformer(
             state_dict,
@@ -4887,9 +4922,11 @@ class HiDreamImageLoraLoaderMixin(LoraBaseMixin):
         kwargs["return_lora_metadata"] = True
         state_dict, metadata = self.lora_state_dict(pretrained_model_name_or_path_or_dict, **kwargs)
 
-        is_correct_format = all("lora" in key for key in state_dict.keys())
+        is_correct_format = all("lora" in key or "lokr" in key for key in state_dict.keys())
         if not is_correct_format:
-            raise ValueError("Invalid LoRA checkpoint. Make sure all LoRA param names contain `'lora'` substring.")
+            raise ValueError(
+                "Invalid LoRA checkpoint. Make sure all LoRA param names contain the `'lora'` or `'lokr'` substring."
+            )
 
         self.load_lora_into_transformer(
             state_dict,
@@ -5082,9 +5119,11 @@ class QwenImageLoraLoaderMixin(LoraBaseMixin):
         kwargs["return_lora_metadata"] = True
         state_dict, metadata = self.lora_state_dict(pretrained_model_name_or_path_or_dict, **kwargs)
 
-        is_correct_format = all("lora" in key for key in state_dict.keys())
+        is_correct_format = all("lora" in key or "lokr" in key for key in state_dict.keys())
         if not is_correct_format:
-            raise ValueError("Invalid LoRA checkpoint. Make sure all LoRA param names contain `'lora'` substring.")
+            raise ValueError(
+                "Invalid LoRA checkpoint. Make sure all LoRA param names contain the `'lora'` or `'lokr'` substring."
+            )
 
         self.load_lora_into_transformer(
             state_dict,
@@ -5276,9 +5315,11 @@ class Krea2LoraLoaderMixin(LoraBaseMixin):
         kwargs["return_lora_metadata"] = True
         state_dict, metadata = self.lora_state_dict(pretrained_model_name_or_path_or_dict, **kwargs)
 
-        is_correct_format = all("lora" in key for key in state_dict.keys())
+        is_correct_format = all("lora" in key or "lokr" in key for key in state_dict.keys())
         if not is_correct_format:
-            raise ValueError("Invalid LoRA checkpoint. Make sure all LoRA param names contain `'lora'` substring.")
+            raise ValueError(
+                "Invalid LoRA checkpoint. Make sure all LoRA param names contain the `'lora'` or `'lokr'` substring."
+            )
 
         self.load_lora_into_transformer(
             state_dict,
@@ -5443,7 +5484,12 @@ class ZImageLoraLoaderMixin(LoraBaseMixin):
         has_lora_unet = any(k.startswith("lora_unet_") for k in state_dict)
         has_diffusion_model = any(k.startswith("diffusion_model.") for k in state_dict)
         has_default = any("default." in k for k in state_dict)
-        if has_alphas_in_sd or has_lora_unet or has_diffusion_model or has_default:
+        is_lokr = any(".lokr_" in k for k in state_dict)
+        if is_lokr:
+            # ai-toolkit Z-Image LoKr checkpoints store module paths that already match the diffusers model.
+            if has_diffusion_model or has_alphas_in_sd:
+                state_dict = _convert_non_diffusers_lokr_to_diffusers(state_dict)
+        elif has_alphas_in_sd or has_lora_unet or has_diffusion_model or has_default:
             state_dict = _convert_non_diffusers_z_image_lora_to_diffusers(state_dict)
 
         out = (state_dict, metadata) if return_lora_metadata else state_dict
@@ -5471,9 +5517,11 @@ class ZImageLoraLoaderMixin(LoraBaseMixin):
         kwargs["return_lora_metadata"] = True
         state_dict, metadata = self.lora_state_dict(pretrained_model_name_or_path_or_dict, **kwargs)
 
-        is_correct_format = all("lora" in key for key in state_dict.keys())
+        is_correct_format = all("lora" in key or "lokr" in key for key in state_dict.keys())
         if not is_correct_format:
-            raise ValueError("Invalid LoRA checkpoint. Make sure all LoRA param names contain `'lora'` substring.")
+            raise ValueError(
+                "Invalid LoRA checkpoint. Make sure all LoRA param names contain the `'lora'` or `'lokr'` substring."
+            )
 
         self.load_lora_into_transformer(
             state_dict,
@@ -5659,9 +5707,11 @@ class AnimaLoraLoaderMixin(LoraBaseMixin):
         kwargs["return_lora_metadata"] = True
         state_dict, metadata = self.lora_state_dict(pretrained_model_name_or_path_or_dict, **kwargs)
 
-        is_correct_format = all("lora" in key for key in state_dict.keys())
+        is_correct_format = all("lora" in key or "lokr" in key for key in state_dict.keys())
         if not is_correct_format:
-            raise ValueError("Invalid LoRA checkpoint. Make sure all LoRA param names contain `'lora'` substring.")
+            raise ValueError(
+                "Invalid LoRA checkpoint. Make sure all LoRA param names contain the `'lora'` or `'lokr'` substring."
+            )
 
         transformer_state_dict = {k: v for k, v in state_dict.items() if k.startswith(f"{self.transformer_name}.")}
         text_conditioner_state_dict = {
@@ -5831,15 +5881,23 @@ class Flux2LoraLoaderMixin(LoraBaseMixin):
         if is_peft_format:
             state_dict = {k.replace("base_model.model.", "diffusion_model."): v for k, v in state_dict.items()}
 
+        is_lokr = any(".lokr_" in k for k in state_dict)
         is_ai_toolkit = any(k.startswith("diffusion_model.") for k in state_dict)
-        if is_ai_toolkit:
+        if is_lokr:
+            if any(k.startswith("lycoris_") for k in state_dict):
+                state_dict = _convert_lycoris_flux2_lokr_to_diffusers(state_dict)
+            elif is_ai_toolkit:
+                state_dict = _convert_non_diffusers_flux2_lokr_to_diffusers(state_dict)
+            elif not any(k.startswith("transformer.") for k in state_dict):
+                # Bare dotted diffusers module paths (e.g. SimpleTuner exports), possibly with alpha keys.
+                state_dict = _convert_non_diffusers_lokr_to_diffusers(state_dict)
+        elif is_ai_toolkit:
             state_dict = _convert_non_diffusers_flux2_lora_to_diffusers(state_dict)
 
         out = (state_dict, metadata) if return_lora_metadata else state_dict
         return out
 
     @require_peft_backend
-    # Copied from diffusers.loaders.lora_pipeline.CogVideoXLoraLoaderMixin.load_lora_weights
     def load_lora_weights(
         self,
         pretrained_model_name_or_path_or_dict: str | dict[str, torch.Tensor],
@@ -5860,13 +5918,33 @@ class Flux2LoraLoaderMixin(LoraBaseMixin):
         kwargs["return_lora_metadata"] = True
         state_dict, metadata = self.lora_state_dict(pretrained_model_name_or_path_or_dict, **kwargs)
 
-        is_correct_format = all("lora" in key for key in state_dict.keys())
+        is_correct_format = all("lora" in key or "lokr" in key for key in state_dict.keys())
         if not is_correct_format:
-            raise ValueError("Invalid LoRA checkpoint. Make sure all LoRA param names contain `'lora'` substring.")
+            raise ValueError(
+                "Invalid LoRA checkpoint. Make sure all LoRA param names contain the `'lora'` or `'lokr'` substring."
+            )
+
+        transformer = getattr(self, self.transformer_name) if not hasattr(self, "transformer") else self.transformer
+
+        # BFL-format LoKr checkpoints apply LoKr to the fused QKV projections, whose Kronecker product delta cannot
+        # be split exactly into separate Q/K/V factors. Fuse the model's projections so the adapter maps 1:1.
+        needs_fused_qkv = any(".attn.to_qkv." in k or ".attn.to_added_qkv." in k for k in state_dict)
+        if needs_fused_qkv:
+            if getattr(transformer, "is_quantized", False):
+                raise ValueError(
+                    "This LoKr checkpoint targets fused QKV projections, which requires fusing the transformer's "
+                    "QKV projections, and that is not supported on quantized models. Please load the transformer "
+                    "without quantization."
+                )
+            logger.info(
+                "The LoKr checkpoint targets fused QKV projections; calling `fuse_qkv_projections()` on the "
+                "transformer before loading the adapter."
+            )
+            transformer.fuse_qkv_projections()
 
         self.load_lora_into_transformer(
             state_dict,
-            transformer=getattr(self, self.transformer_name) if not hasattr(self, "transformer") else self.transformer,
+            transformer=transformer,
             adapter_name=adapter_name,
             metadata=metadata,
             _pipeline=self,
@@ -6056,9 +6134,11 @@ class Ideogram4LoraLoaderMixin(LoraBaseMixin):
         kwargs["return_lora_metadata"] = True
         state_dict, metadata = self.lora_state_dict(pretrained_model_name_or_path_or_dict, **kwargs)
 
-        is_correct_format = all("lora" in key for key in state_dict.keys())
+        is_correct_format = all("lora" in key or "lokr" in key for key in state_dict.keys())
         if not is_correct_format:
-            raise ValueError("Invalid LoRA checkpoint. Make sure all LoRA param names contain `'lora'` substring.")
+            raise ValueError(
+                "Invalid LoRA checkpoint. Make sure all LoRA param names contain the `'lora'` or `'lokr'` substring."
+            )
 
         self.load_lora_into_transformer(
             state_dict,
@@ -6256,9 +6336,11 @@ class ErnieImageLoraLoaderMixin(LoraBaseMixin):
         kwargs["return_lora_metadata"] = True
         state_dict, metadata = self.lora_state_dict(pretrained_model_name_or_path_or_dict, **kwargs)
 
-        is_correct_format = all("lora" in key for key in state_dict.keys())
+        is_correct_format = all("lora" in key or "lokr" in key for key in state_dict.keys())
         if not is_correct_format:
-            raise ValueError("Invalid LoRA checkpoint. Make sure all LoRA param names contain `'lora'` substring.")
+            raise ValueError(
+                "Invalid LoRA checkpoint. Make sure all LoRA param names contain the `'lora'` or `'lokr'` substring."
+            )
 
         self.load_lora_into_transformer(
             state_dict,
@@ -6446,9 +6528,11 @@ class CosmosLoraLoaderMixin(LoraBaseMixin):
         kwargs["return_lora_metadata"] = True
         state_dict, metadata = self.lora_state_dict(pretrained_model_name_or_path_or_dict, **kwargs)
 
-        is_correct_format = all("lora" in key for key in state_dict.keys())
+        is_correct_format = all("lora" in key or "lokr" in key for key in state_dict.keys())
         if not is_correct_format:
-            raise ValueError("Invalid LoRA checkpoint. Make sure all LoRA param names contain `'lora'` substring.")
+            raise ValueError(
+                "Invalid LoRA checkpoint. Make sure all LoRA param names contain the `'lora'` or `'lokr'` substring."
+            )
 
         self.load_lora_into_transformer(
             state_dict,

@@ -242,6 +242,24 @@ class TestFluxPipelineMagCache(FluxPipelineTesterConfig, MagCacheTesterMixin):
 class TestFluxPipelineLoRA(FluxPipelineTesterConfig, LoraTesterMixin):
     """LoRA tests for the Flux pipeline."""
 
+    def test_kohya_clip_text_encoder_lora_under_flattened_clip(self):
+        # Regression for huggingface/diffusers#13984: transformers >= 5.6 removed the
+        # `text_model.` wrapper from CLIPTextModel, but kohya-converted state dicts still
+        # carry that prefix, which left the rank dict empty and raised IndexError.
+        pipe = self.get_pipeline().to(torch_device)
+        if hasattr(pipe.text_encoder, "text_model"):
+            pytest.skip("transformers still exposes the text_model wrapper")
+
+        state_dict = {}
+        for name, module in pipe.text_encoder.named_modules():
+            if name.endswith((".q_proj", ".k_proj", ".v_proj", ".out_proj", ".fc1", ".fc2")):
+                state_dict[f"text_encoder.text_model.{name}.lora_A.weight"] = torch.randn(2, module.in_features)
+                state_dict[f"text_encoder.text_model.{name}.lora_B.weight"] = torch.randn(module.out_features, 2)
+
+        pipe.load_lora_weights(state_dict)
+        assert check_if_lora_correctly_set(pipe.text_encoder), "Lora not correctly set in text encoder"
+        pipe.unload_lora_weights()
+
     def test_with_alpha_in_state_dict(self, tmp_path):
         pipe = self.get_pipeline().to(torch_device)
         self.add_adapters_to_pipeline(pipe, components=["transformer"])

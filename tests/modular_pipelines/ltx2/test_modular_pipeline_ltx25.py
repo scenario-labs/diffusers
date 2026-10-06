@@ -13,6 +13,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import functools
+
 import numpy as np
 import PIL.Image
 import pytest
@@ -22,6 +24,7 @@ from diffusers.modular_pipelines import LTX2AutoBlocks, LTX25AutoBlocks, LTX25Mo
 from diffusers.pipelines.ltx2.pipeline_ltx2_condition import LTX2VideoCondition
 from diffusers.pipelines.ltx2.pipeline_ltx2_ic_lora import LTX2ReferenceCondition
 
+from ...testing_utils import assert_tensors_close
 from ..testing_utils import (
     BaseModularPipelineTesterConfig,
     ModularLoadingTesterMixin,
@@ -181,6 +184,45 @@ class TestLTX25Text2VideoModularPipelineFast(
         num_frames = videos.shape[1]
         assert (num_frames - 1) % pipe.vae_temporal_compression_ratio == 0
         assert 0 < num_frames <= round(2.0 * inputs["frame_rate"])
+
+    def test_conditioning_frame_rate_rescales_only_the_video_time_axis(self):
+        pipe = self.get_pipeline().to("cpu")
+        frame_rate = self.get_dummy_inputs()["frame_rate"]
+        forward = pipe.transformer.forward
+
+        def run(**overrides):
+            calls = []
+
+            @functools.wraps(forward)  # keeps the signature the modular loop filters kwargs by
+            def recording_forward(*args, **kwargs):
+                calls.append(
+                    {
+                        "video_coords": kwargs["video_coords"].clone(),
+                        "audio_tokens": kwargs["audio_hidden_states"].shape[1],
+                    }
+                )
+                return forward(*args, **kwargs)
+
+            pipe.transformer.forward = recording_forward
+            try:
+                output = pipe(**{**self.get_dummy_inputs(), **overrides}, output=["videos", "audio"])
+            finally:
+                pipe.transformer.forward = forward
+            return output, calls
+
+        default, default_calls = run()
+        same, _ = run(conditioning_frame_rate=frame_rate)
+        slow, slow_calls = run(conditioning_frame_rate=2 * frame_rate)
+
+        assert_tensors_close(same["videos"], default["videos"], atol=1e-6, rtol=0)
+
+        default_coords, slow_coords = default_calls[0]["video_coords"], slow_calls[0]["video_coords"]
+        assert_tensors_close(slow_coords[:, 0], default_coords[:, 0] / 2, atol=1e-6, rtol=1e-6)
+        assert torch.equal(slow_coords[:, 1:], default_coords[:, 1:])
+        assert slow_calls[0]["audio_tokens"] == default_calls[0]["audio_tokens"]
+        assert slow["videos"].shape == default["videos"].shape
+        assert slow["audio"].shape == default["audio"].shape
+        assert not torch.allclose(slow["videos"], default["videos"])
 
 
 class TestLTX25Text2VideoModularPipelineLoading(LTX25Text2VideoModularPipelineTesterConfig, ModularLoadingTesterMixin):

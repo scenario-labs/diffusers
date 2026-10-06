@@ -12,6 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import functools
+
 import pytest
 import torch
 
@@ -243,6 +245,52 @@ class TestLTX2Pipeline(LTX2PipelineTesterConfig, PipelineTesterMixin):
 
         with pytest.raises(ValueError, match="min_seconds"):
             pipe(**inputs)
+
+    def _run_recording_transformer_inputs(self, pipe, **overrides):
+        calls = []
+        forward = pipe.transformer.forward
+
+        @functools.wraps(forward)  # keeps the signature the modular loop filters kwargs by
+        def recording_forward(*args, **kwargs):
+            calls.append(
+                {
+                    "video_coords": kwargs["video_coords"].clone(),
+                    "audio_tokens": kwargs["audio_hidden_states"].shape[1],
+                    "fps": kwargs["fps"],
+                }
+            )
+            return forward(*args, **kwargs)
+
+        pipe.transformer.forward = recording_forward
+        try:
+            output = pipe(**{**self.get_dummy_inputs(), **overrides})
+        finally:
+            pipe.transformer.forward = forward
+        return output, calls
+
+    def test_conditioning_frame_rate_rescales_only_the_video_time_axis(self):
+        pipe = self.get_pipeline()
+        frame_rate = self.get_dummy_inputs()["frame_rate"]
+
+        default, default_calls = self._run_recording_transformer_inputs(pipe)
+        same, _ = self._run_recording_transformer_inputs(pipe, conditioning_frame_rate=frame_rate)
+        slow, slow_calls = self._run_recording_transformer_inputs(pipe, conditioning_frame_rate=2 * frame_rate)
+
+        # Defaulting to `frame_rate` leaves the pipeline unchanged.
+        assert_tensors_close(same.frames, default.frames, atol=1e-6, rtol=0)
+        assert_tensors_close(same.audio, default.audio, atol=1e-6, rtol=0)
+
+        # A doubled conditioning rate halves the time axis of the video positions and nothing else.
+        default_coords, slow_coords = default_calls[0]["video_coords"], slow_calls[0]["video_coords"]
+        assert_tensors_close(slow_coords[:, 0], default_coords[:, 0] / 2, atol=1e-6, rtol=1e-6)
+        assert torch.equal(slow_coords[:, 1:], default_coords[:, 1:])
+        assert all(call["fps"] == 2 * frame_rate for call in slow_calls)
+
+        # Audio length and the output shapes keep following the playback `frame_rate`.
+        assert slow_calls[0]["audio_tokens"] == default_calls[0]["audio_tokens"]
+        assert slow.frames.shape == default.frames.shape
+        assert slow.audio.shape == default.audio.shape
+        assert not torch.allclose(slow.frames, default.frames)
 
 
 class TestLTX2PipelineMemory(LTX2PipelineTesterConfig, LTX2MemoryTesterMixin):

@@ -14,6 +14,8 @@
 
 import copy
 import inspect
+import math
+from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import Any, Callable
 
@@ -29,15 +31,18 @@ from transformers import (
 
 from ...callbacks import MultiPipelineCallbacks, PipelineCallback
 from ...loaders import FromSingleFileMixin, LTX2LoraLoaderMixin
-from ...models.autoencoders import AutoencoderKLLTX2Audio, AutoencoderKLLTX2Video
+from ...models.autoencoders import AutoencoderKLLTX2Audio, AutoencoderKLLTX2Video, LTX2VideoDiffusionDecoderModel
+from ...models.autoencoders.vae import DiagonalGaussianDistribution
 from ...models.transformers import LTX2VideoTransformer3DModel
 from ...schedulers import FlowMatchEulerDiscreteScheduler
 from ...utils import is_torch_xla_available, logging, replace_example_docstring
 from ...utils.torch_utils import randn_tensor
 from ..pipeline_utils import DiffusionPipeline
 from .connectors import LTX2TextConnectors
+from .dfr_layout import resolve_seam_positions
 from .image_processor import LTX2VideoHDRProcessor
 from .pipeline_output import LTX2PipelineOutput
+from .utils import DISTILLED_SIGMA_VALUES, SNAP_CONDITIONING_FPS_ABOVE
 from .vocoder import LTX2Vocoder, LTX2VocoderWithBWE
 
 
@@ -49,6 +54,13 @@ else:
     XLA_AVAILABLE = False
 
 logger = logging.get_logger(__name__)  # pylint: disable=invalid-name
+
+# The LTX-2.5 SDR-To-HDR IC-LoRA conditions RoPE on 30 fps for sources above 30 fps; the playback frame rate is
+# unchanged (`_conditioning_fps` in `ltx_pipelines/hdr_ic_lora.py`).
+SDR_TO_HDR_MAX_CONDITIONING_FPS = 30.0
+# Frame area above which the SDR-To-HDR seam guides are VAE-encoded tile by tile, when VAE tiling is enabled
+# (`TILED_VAE_ENCODE_PIXEL_THRESHOLD` in `ltx_pipelines/hdr_ic_lora.py`).
+SDR_TO_HDR_TILED_ENCODE_PIXEL_THRESHOLD = 512 * 768
 
 
 @dataclass
@@ -121,6 +133,70 @@ EXAMPLE_DOC_STRING = """
         >>> # Convert the HDR video to a SDR sRGB-tonemapped `.mp4` video.
         >>> # A custom tone-mapper can be specified via the `tone_mapping_fn` argument.
         >>> encode_hdr_tensor_to_mp4(hdr_video[0], "ltx2_hdr_lora_output.mp4", frame_rate=24.0)
+        ```
+
+        LTX-2.5 SDR-To-HDR IC-LoRA (ACEScct). The LoRA ships a precomputed scene embedding, so the text encoder is not
+        needed, and the clip keeps its own resolution and frame count:
+
+        ```py
+        >>> import torch
+        >>> from huggingface_hub import hf_hub_download
+        >>> from safetensors.torch import load_file
+        >>> from diffusers import LTX2HDRPipeline
+        >>> from diffusers.models.autoencoders.ltx2_diffusion_decoder import LTX2VideoVaeNeighborhoodNattenProcessor
+        >>> from diffusers.pipelines.ltx2.export_utils import encode_hdr_tensor_to_hlg_mp4, export_to_exr_sequence
+        >>> from diffusers.pipelines.ltx2.image_processor import acescct_to_linear
+        >>> from diffusers.pipelines.ltx2.pipeline_ltx2_hdr_lora import LTX2HDRReferenceCondition
+        >>> from diffusers.utils import load_video
+
+        >>> # The VAE and the diffusion decoder run in float32, as in the reference (the pipeline would otherwise
+        >>> # upcast them for each call).
+        >>> pipe = LTX2HDRPipeline.from_pretrained(
+        ...     "Lightricks/LTX-2.5-Diffusers",
+        ...     hdr_transform="acescct",
+        ...     text_encoder=None,
+        ...     tokenizer=None,
+        ...     connectors=None,
+        ...     dtype={"default": torch.bfloat16, "vae": torch.float32, "diffusion_decoder": torch.float32},
+        ... )
+        >>> pipe.enable_model_cpu_offload()
+        >>> # The diffusion decoder needs NATTEN (`pip install kernels`) and tiling at video resolutions.
+        >>> pipe.diffusion_decoder.set_attn_processor(LTX2VideoVaeNeighborhoodNattenProcessor())
+        >>> pipe.diffusion_decoder.enable_tiling()
+
+        >>> repo_id = "Lightricks/LTX-2.5-22b-IC-LoRA-SDR-To-HDR"
+        >>> pipe.load_lora_weights(
+        ...     repo_id, adapter_name="sdr_to_hdr", weight_name="ltx-2.5-22b-ic-lora-sdr-to-hdr-1.0.safetensors"
+        ... )
+        >>> pipe.set_adapters("sdr_to_hdr", 1.0)
+        >>> scene_embeds = load_file(hf_hub_download(repo_id, "ltx-2.5-22b-ic-lora-sdr-to-hdr-scene-emb.safetensors"))
+
+        >>> # An 8-bit sRGB clip with 8k + 1 frames. Any size works: it is reflect-padded to a multiple of 32 and the
+        >>> # output is cropped back.
+        >>> sdr_video = load_video("/path/to/sdr.mp4")
+        >>> frame_rate = 24.0
+        >>> # Seam keyframes are on by default (`keyframe_strength=0.95`) and anchor the diffusion decoder; pass
+        >>> # `keyframe_strength=None` for the plain IC-LoRA, or `high_quality_hdr=True` to generate at twice the frames.
+        >>> acescct = pipe(
+        ...     reference_conditions=LTX2HDRReferenceCondition(frames=sdr_video),
+        ...     connector_video_embeds=scene_embeds["video_context"],
+        ...     input_colorspace="srgb_gamma",
+        ...     output_colorspace="acescct",
+        ...     height=sdr_video[0].height,
+        ...     width=sdr_video[0].width,
+        ...     num_frames=len(sdr_video),
+        ...     frame_rate=frame_rate,
+        ...     generator=torch.Generator("cuda").manual_seed(42),
+        ... ).frames[0]
+
+
+        >>> def to_linear(frames, colorspace):  # (F, H, W, 3) ACEScct codes -> scene-linear HDR
+        ...     return acescct_to_linear(frames.permute(0, 3, 1, 2), colorspace).permute(0, 2, 3, 1)
+
+
+        >>> # A BT.2020 HLG master from scene-linear Rec.709, and an ACEScg EXR sequence.
+        >>> encode_hdr_tensor_to_hlg_mp4(to_linear(acescct, "rec709"), "ltx2_sdr_to_hdr.mp4", frame_rate=frame_rate)
+        >>> export_to_exr_sequence(to_linear(acescct, "acescg"), "ltx2_sdr_to_hdr_exr", exr_colorspace="acescg")
         ```
 """
 
@@ -254,7 +330,27 @@ class LTX2HDRPipeline(DiffusionPipeline, FromSingleFileMixin, LTX2LoraLoaderMixi
     - Video-only (no audio output). The transformer's audio branch is still run since the diffusers transformer API
       requires audio inputs, but the decoded audio is discarded and audio-specific guidance scales are fixed to no-op
       values to avoid wasted compute.
-    - No frame-level keyframe conditioning (the reference HDR pipeline does not support this).
+    - No user-supplied frame-level keyframe conditioning (the reference HDR pipelines do not support this).
+
+    With `hdr_transform="acescct"`, the pipeline runs the LTX-2.5 SDR-To-HDR IC-LoRA the way the reference
+    `HDRICLoraPipeline` does:
+
+    - the reference video is mapped to ACEScct (see `input_colorspace`), reflect-padded to a multiple of the VAE's
+      spatial compression ratio and VAE-encoded in float32; the output is cropped back to `height` x `width`;
+    - the transformer is conditioned on precomputed `connector_video_embeds` only. No prompt is encoded, so
+      `text_encoder`, `tokenizer` and `connectors` can be loaded as `None`;
+    - the denoising is video-only: audio-to-video cross-attention is disabled, so the placeholder audio stream has no
+      influence on the video;
+    - a single distilled stage (`DISTILLED_SIGMA_VALUES` by default, used as given), without CFG, STG or modality
+      guidance, and with RoPE conditioned on at most 30 fps;
+    - seam keyframes (`keyframe_strength`, on by default): at every 24- or 32-frame segment seam of the clip (see
+      [`~pipelines.ltx2.dfr_layout.resolve_seam_positions`]), the source frame is VAE-encoded on its own and appended
+      as a one-frame guide at `keyframe_strength`, together with an empty generated keyframe slot at the same position.
+      The slots are denoised with the video, then anchor its decode by `diffusion_decoder`;
+    - optionally (`high_quality_hdr`), every source frame is doubled, `2 * num_frames - 1` frames are generated and
+      every second one is kept;
+    - the latents are decoded in float32, by `diffusion_decoder` when it is loaded and by `vae` otherwise, then
+      converted from ACEScct to scene-linear HDR (see `output_colorspace`).
 
     Two-stage inference is supported through separate calls to `__call__`:
 
@@ -282,12 +378,18 @@ class LTX2HDRPipeline(DiffusionPipeline, FromSingleFileMixin, LTX2LoraLoaderMixi
             Transformer backbone.
         vocoder ([`LTX2Vocoder`] or [`LTX2VocoderWithBWE`]):
             Vocoder. Required for transformer compatibility; its outputs are discarded.
+        audio_scheduler ([`FlowMatchEulerDiscreteScheduler`], *optional*):
+            Scheduler for the (discarded) audio stream. Defaults to a copy of `scheduler`.
+        diffusion_decoder ([`LTX2VideoDiffusionDecoderModel`], *optional*):
+            The LTX-2.5 diffusion video decoder. Only used with `hdr_transform="acescct"`, where it replaces `vae` for
+            decoding, as in the reference implementation.
         hdr_transform (`str`, *optional*, defaults to `"logc3"`):
-            HDR transform identifier applied during postprocessing. Currently only `"logc3"` is supported.
+            HDR transform of the IC-LoRA: `"logc3"` (ARRI LogC3, LTX-2.3 HDR IC-LoRA) or `"acescct"` (ACEScct, LTX-2.5
+            SDR-To-HDR IC-LoRA). See [`LTX2VideoHDRProcessor`].
     """
 
-    model_cpu_offload_seq = "text_encoder->connectors->transformer->vae->audio_vae->vocoder"
-    _optional_components = ["audio_scheduler"]
+    model_cpu_offload_seq = "text_encoder->connectors->transformer->vae->diffusion_decoder->audio_vae->vocoder"
+    _optional_components = ["audio_scheduler", "diffusion_decoder"]
     _callback_tensor_inputs = ["latents", "prompt_embeds", "negative_prompt_embeds"]
 
     def __init__(
@@ -301,11 +403,13 @@ class LTX2HDRPipeline(DiffusionPipeline, FromSingleFileMixin, LTX2LoraLoaderMixi
         transformer: LTX2VideoTransformer3DModel,
         vocoder: LTX2Vocoder | LTX2VocoderWithBWE,
         audio_scheduler: FlowMatchEulerDiscreteScheduler | None = None,
+        diffusion_decoder: LTX2VideoDiffusionDecoderModel | None = None,
         hdr_transform: str = "logc3",
     ):
         super().__init__()
 
         self.register_modules(
+            diffusion_decoder=diffusion_decoder,
             vae=vae,
             audio_vae=audio_vae,
             text_encoder=text_encoder,
@@ -351,6 +455,7 @@ class LTX2HDRPipeline(DiffusionPipeline, FromSingleFileMixin, LTX2LoraLoaderMixi
             vae_scale_factor=self.vae_spatial_compression_ratio,
             hdr_transform=hdr_transform,
         )
+        self.register_to_config(hdr_transform=hdr_transform)
 
         self.tokenizer_max_length = (
             self.tokenizer.model_max_length if getattr(self, "tokenizer", None) is not None else 1024
@@ -569,6 +674,98 @@ class LTX2HDRPipeline(DiffusionPipeline, FromSingleFileMixin, LTX2LoraLoaderMixi
                 " block indices at which to apply STG in `spatio_temporal_guidance_blocks`"
             )
 
+    def check_sdr_to_hdr_inputs(
+        self,
+        prompt,
+        num_frames,
+        reference_conditions,
+        callback_on_step_end_tensor_inputs=None,
+        prompt_embeds=None,
+        negative_prompt_embeds=None,
+        connector_video_embeds=None,
+        latents=None,
+        guidance_scale=1.0,
+        stg_scale=0.0,
+        modality_scale=1.0,
+        keyframe_strength=None,
+    ):
+        r"""Input checks for `hdr_transform="acescct"` (LTX-2.5 SDR-To-HDR IC-LoRA)."""
+        if callback_on_step_end_tensor_inputs is not None and not all(
+            k in self._callback_tensor_inputs for k in callback_on_step_end_tensor_inputs
+        ):
+            raise ValueError(
+                f"`callback_on_step_end_tensor_inputs` has to be in {self._callback_tensor_inputs}, but found {[k for k in callback_on_step_end_tensor_inputs if k not in self._callback_tensor_inputs]}"
+            )
+
+        # The reference runs no text encoder: the transformer only sees the IC-LoRA's precomputed video context.
+        if prompt is not None or prompt_embeds is not None or negative_prompt_embeds is not None:
+            raise ValueError(
+                "`hdr_transform='acescct'` conditions on `connector_video_embeds` only; `prompt`, `prompt_embeds` and"
+                " `negative_prompt_embeds` are not supported."
+            )
+        if connector_video_embeds is None:
+            raise ValueError("`hdr_transform='acescct'` requires `connector_video_embeds`.")
+        if connector_video_embeds.ndim not in (2, 3):
+            raise ValueError(
+                "`connector_video_embeds` must have shape `(sequence_length, dim)` or `(batch_size, sequence_length,"
+                f" dim)`, but got {tuple(connector_video_embeds.shape)}."
+            )
+
+        # The reference denoiser makes a single unguided forward per step.
+        if guidance_scale > 1.0 or stg_scale > 0.0 or modality_scale > 1.0:
+            raise ValueError(
+                "`hdr_transform='acescct'` runs the distilled model without guidance; `guidance_scale` and"
+                f" `modality_scale` must be <= 1 and `stg_scale` 0, but got {guidance_scale}, {modality_scale} and"
+                f" {stg_scale}."
+            )
+
+        if not reference_conditions:
+            raise ValueError("`hdr_transform='acescct'` requires a reference video in `reference_conditions`.")
+
+        if (num_frames - 1) % self.vae_temporal_compression_ratio != 0:
+            raise ValueError(
+                f"`num_frames` must be of the form {self.vae_temporal_compression_ratio}k + 1 with"
+                f" `hdr_transform='acescct'`, but got {num_frames}."
+            )
+
+        if latents is not None and latents.ndim != 5:
+            raise ValueError(
+                f"Only unpacked (5D) video latents of shape `[batch_size, latent_channels, latent_frames,"
+                f" latent_height, latent_width] are supported, but got {latents.ndim} dims."
+            )
+
+        if keyframe_strength is not None:
+            if not 0.0 <= keyframe_strength <= 1.0:
+                raise ValueError(f"`keyframe_strength` must be in [0, 1] or `None`, but got {keyframe_strength}.")
+            seams = resolve_seam_positions(num_frames, temporal_compression_ratio=self.vae_temporal_compression_ratio)
+            if seams and len(reference_conditions) != 1:
+                raise ValueError(
+                    "Seam keyframes are encoded from the source video, so `keyframe_strength` needs exactly one"
+                    f" reference video, but got {len(reference_conditions)}. Pass `keyframe_strength=None` to run"
+                    " without seam keyframes."
+                )
+            # `assert_stage_supports_generated_keyframes` in the reference: a generated slot is only told apart from a
+            # video frame by the learned keyframe embedding.
+            if seams and not self.transformer.config.use_keyframes_abs_pos_embedding:
+                raise ValueError(
+                    "Seam keyframes generate keyframe slots, which needs a transformer whose config sets"
+                    " `use_keyframes_abs_pos_embedding` (LTX-2.5). Pass `keyframe_strength=None` to run without seam"
+                    " keyframes."
+                )
+
+    @contextmanager
+    def _float32(self, module: torch.nn.Module):
+        r"""Run `module` in float32 for the duration of the context, then restore its dtype."""
+        dtype = module.dtype
+        if dtype == torch.float32:
+            yield module
+            return
+        module.to(dtype=torch.float32)
+        try:
+            yield module
+        finally:
+            module.to(dtype=dtype)
+
     @staticmethod
     # Copied from diffusers.pipelines.ltx2.pipeline_ltx2.LTX2Pipeline._pack_latents
     def _pack_latents(latents: torch.Tensor, patch_size: int = 1, patch_size_t: int = 1) -> torch.Tensor:
@@ -693,6 +890,103 @@ class LTX2HDRPipeline(DiffusionPipeline, FromSingleFileMixin, LTX2LoraLoaderMixi
             latents = latents.unflatten(2, (-1, num_mel_bins)).transpose(1, 2)
         return latents
 
+    # Copied from diffusers.pipelines.ltx2.pipeline_ltx2_condition.LTX2ConditionPipeline._prepare_keyframe_coords
+    def _prepare_keyframe_coords(
+        self,
+        keyframe_latent_num_frames: int,
+        keyframe_latent_height: int,
+        keyframe_latent_width: int,
+        pixel_frame_idx: int,
+        num_pixel_frames: int,
+        fps: float,
+        device: torch.device,
+    ) -> torch.Tensor:
+        """
+        Compute positional coordinates for a keyframe condition being appended as extra tokens.
+
+        Mirrors `VideoConditionByKeyframeIndex.apply_to` in the reference implementation:
+        - Latent coords scaled to pixel space *without* the causal fix (since non-zero-index keyframes don't need the
+          first-frame causal adjustment).
+        - Temporal axis offset by `pixel_frame_idx` (the pixel-space index at which the keyframe appears).
+        - For single-pixel-frame keyframes, the per-patch temporal extent is clamped to `[idx, idx + 1)` so the
+          keyframe occupies a single pixel timestep rather than the VAE-scaled range.
+        - Temporal coords divided by `fps` to produce seconds.
+        """
+        patch_size = self.transformer_spatial_patch_size
+        patch_size_t = self.transformer_temporal_patch_size
+        scale_factors = (
+            self.vae_temporal_compression_ratio,
+            self.vae_spatial_compression_ratio,
+            self.vae_spatial_compression_ratio,
+        )
+
+        grid_f = torch.arange(
+            start=0, end=keyframe_latent_num_frames, step=patch_size_t, dtype=torch.float32, device=device
+        )
+        grid_h = torch.arange(start=0, end=keyframe_latent_height, step=patch_size, dtype=torch.float32, device=device)
+        grid_w = torch.arange(start=0, end=keyframe_latent_width, step=patch_size, dtype=torch.float32, device=device)
+        grid = torch.meshgrid(grid_f, grid_h, grid_w, indexing="ij")
+        grid = torch.stack(grid, dim=0)
+
+        patch_size_delta = torch.tensor((patch_size_t, patch_size, patch_size), dtype=grid.dtype, device=device)
+        patch_ends = grid + patch_size_delta.view(3, 1, 1, 1)
+
+        latent_coords = torch.stack([grid, patch_ends], dim=-1)  # [3, N_F, N_H, N_W, 2]
+        latent_coords = latent_coords.flatten(1, 3)  # [3, num_patches, 2]
+        latent_coords = latent_coords.unsqueeze(0)  # [1, 3, num_patches, 2]
+
+        scale_tensor = torch.tensor(scale_factors, device=device, dtype=latent_coords.dtype)
+        broadcast_shape = [1] * latent_coords.ndim
+        broadcast_shape[1] = -1
+        pixel_coords = latent_coords * scale_tensor.view(*broadcast_shape)
+
+        # No causal fix: keyframe coords place the keyframe at `pixel_frame_idx` without the first-frame adjustment.
+        pixel_coords[:, 0, :, :] = pixel_coords[:, 0, :, :] + pixel_frame_idx
+
+        if num_pixel_frames == 1:
+            # Single-pixel-frame keyframe: clamp temporal extent to [idx, idx + 1).
+            pixel_coords[:, 0, :, 1:] = pixel_coords[:, 0, :, :1] + 1
+
+        pixel_coords[:, 0, :, :] = pixel_coords[:, 0, :, :] / fps
+
+        return pixel_coords
+
+    # Copied from diffusers.pipelines.ltx2.pipeline_ltx2_dfr.LTX2DFRPipeline._unpack_video_latents
+    def _unpack_video_latents(self, tokens: torch.Tensor, num_frames: int, height: int, width: int) -> torch.Tensor:
+        """Unpack a `(batch_size, tokens, channels)` block onto this transformer's patch grid."""
+        return self._unpack_latents(
+            tokens,
+            num_frames,
+            height,
+            width,
+            self.transformer_spatial_patch_size,
+            self.transformer_temporal_patch_size,
+        )
+
+    # Copied from diffusers.pipelines.ltx2.pipeline_ltx2_dfr.LTX2DFRPipeline._unpack_video_and_slots
+    def _unpack_video_and_slots(
+        self,
+        packed: torch.Tensor,
+        num_frames: int,
+        height: int,
+        width: int,
+        slot_token_slice: slice | None,
+        num_slots: int,
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        latent_num_frames = (num_frames - 1) // self.vae_temporal_compression_ratio + 1
+        latent_height = height // self.vae_spatial_compression_ratio
+        latent_width = width // self.vae_spatial_compression_ratio
+        video = self._unpack_video_latents(
+            packed[:, : latent_num_frames * latent_height * latent_width],
+            latent_num_frames,
+            latent_height,
+            latent_width,
+        )
+        keyframes = None
+        if slot_token_slice is not None and num_slots:
+            keyframes = self._unpack_video_latents(packed[:, slot_token_slice], num_slots, latent_height, latent_width)
+        return video, keyframes
+
     def prepare_latents(
         self,
         reference_conditions: list[LTX2HDRReferenceCondition] | None = None,
@@ -708,25 +1002,40 @@ class LTX2HDRPipeline(DiffusionPipeline, FromSingleFileMixin, LTX2LoraLoaderMixi
         device: torch.device | None = None,
         generator: torch.Generator | None = None,
         latents: torch.Tensor | None = None,
+        input_colorspace: str | None = None,
+        seam_frame_indices: list[int] | None = None,
+        keyframe_strength: float | None = None,
+        high_quality_hdr: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor | None, int, torch.Tensor | None]:
         r"""
         Prepare noisy video latents, applying HDR IC-LoRA reference-video conditioning.
 
-        Builds a packed latent sequence in the order `[base | reference]`:
+        Builds a packed latent sequence in the order `[base | reference | guides | slots]`, the order in which the
+        reference `HDRICLoraPipeline` applies its conditionings:
           - Base: either fresh noise (Stage 1, `latents=None`) or pre-existing upsampled latents (Stage 2).
           - Reference: HDR-encoded reference-video tokens appended with per-token `conditioning_mask = strength`,
-            following the same pattern as [`LTX2InContextPipeline.prepare_latents`]. (HDR LoRA does not currently take
-            per-frame `conditions`, so there is no first-frame / keyframe block in between.)
+            following the same pattern as [`LTX2InContextPipeline.prepare_latents`].
+          - Guides (`hdr_transform="acescct"` with `seam_frame_indices`): per seam, one latent frame encoded from the
+            source frame alone, with `conditioning_mask = keyframe_strength` and a RoPE time span of exactly one pixel
+            frame at the seam (`VideoConditionByKeyframeIndex`).
+          - Slots (same condition): per seam, one latent frame of empty tokens with `conditioning_mask = 0` and the
+            guide's coordinates, contiguous (`VideoGeneratedKeyframeSlots`). The model generates their content.
 
         Returns a 6-tuple matching [`LTX2InContextPipeline.prepare_latents`]:
-            - `latents`: packed noisy latents `(B, base + n_ref, C)`.
-            - `conditioning_mask`: `(B, seq_len, 1)` with `strength` at reference positions, `0` elsewhere.
-            - `clean_latents`: clean reference values at reference positions (zeros elsewhere); same shape as
-              `latents`.
-            - `appended_coords`: `[1, 3, n_ref, 2]` reference coordinates to concat onto `video_coords`, or `None` when
-              no reference conditions are provided.
-            - `num_ref_tokens`: count of reference tokens at the END of `latents`.
+            - `latents`: packed noisy latents `(B, base + n_appended, C)`.
+            - `conditioning_mask`: `(B, seq_len, 1)` with each appended token's strength, `0` elsewhere.
+            - `clean_latents`: clean conditioning values at reference and guide positions (zeros elsewhere); same shape
+              as `latents`.
+            - `appended_coords`: `[1, 3, n_appended, 2]` coordinates to concat onto `video_coords`, or `None` when no
+              reference conditions are provided.
+            - `num_appended_tokens`: count of the reference, guide and slot tokens at the END of `latents`. The slots
+              are the last `len(seam_frame_indices)` latent frames' worth of them.
             - `ref_cross_mask`: always `None` for HDR LoRA (no cross-attention masking support).
+
+        `input_colorspace` is forwarded to [`LTX2VideoHDRProcessor.preprocess_reference_video_hdr`] and is only
+        supported with `hdr_transform="acescct"`, as are `seam_frame_indices`, `keyframe_strength` and
+        `high_quality_hdr` (`num_frames` is then the doubled `2 * N - 1` frame count; see
+        [`~LTX2HDRPipeline._encode_reference_conditions`]).
         """
         latent_height = height // self.vae_spatial_compression_ratio
         latent_width = width // self.vae_spatial_compression_ratio
@@ -772,7 +1081,7 @@ class LTX2HDRPipeline(DiffusionPipeline, FromSingleFileMixin, LTX2LoraLoaderMixi
         ref_coords: torch.Tensor | None = None
         num_ref_tokens = 0
         if reference_conditions is not None and len(reference_conditions) > 0:
-            ref_latents_packed, ref_coords, _ = self._encode_reference_conditions(
+            ref_latents_packed, ref_coords, _, guide_latents = self._encode_reference_conditions(
                 reference_conditions=reference_conditions,
                 num_frames=num_frames,
                 height=height,
@@ -782,6 +1091,9 @@ class LTX2HDRPipeline(DiffusionPipeline, FromSingleFileMixin, LTX2LoraLoaderMixi
                 dtype=dtype,
                 device=device,
                 generator=generator[0] if isinstance(generator, list) else generator,
+                input_colorspace=input_colorspace,
+                high_quality_hdr=high_quality_hdr,
+                guide_frame_indices=seam_frame_indices,
             )
             num_ref_tokens = ref_latents_packed.shape[1]
 
@@ -803,8 +1115,64 @@ class LTX2HDRPipeline(DiffusionPipeline, FromSingleFileMixin, LTX2LoraLoaderMixi
             conditioning_mask = torch.cat([conditioning_mask, ref_mask_full], dim=1)
             clean_latents = torch.cat([clean_latents, ref_latents_packed_b], dim=1)
 
-        # HDR LoRA has no keyframe conditions, so the only appended tokens are reference tokens.
         appended_coords = ref_coords
+        num_appended_tokens = num_ref_tokens
+        if seam_frame_indices and ref_coords is not None:
+            latent_height_t = latent_height // self.transformer_spatial_patch_size
+            latent_width_t = latent_width // self.transformer_spatial_patch_size
+            appended_coords = [ref_coords]
+
+            # Seam guides (`_keyframe_conditionings_from_pixel_frames`, `hdr_ic_lora.py:109-143`). Like the reference
+            # tokens above, their clean content also goes into `latents`, so the noising below leaves them at
+            # `keyframe_strength * clean + (1 - keyframe_strength) * noise`.
+            for position, guide_latent in zip(seam_frame_indices, guide_latents):
+                guide_tokens = self._pack_latents(
+                    guide_latent, self.transformer_spatial_patch_size, self.transformer_temporal_patch_size
+                ).expand(batch_size, -1, -1)
+                latents = torch.cat([latents, guide_tokens], dim=1)
+                clean_latents = torch.cat([clean_latents, guide_tokens], dim=1)
+                conditioning_mask = torch.cat(
+                    [
+                        conditioning_mask,
+                        conditioning_mask.new_full((batch_size, guide_tokens.shape[1], 1), keyframe_strength),
+                    ],
+                    dim=1,
+                )
+                appended_coords.append(
+                    self._prepare_keyframe_coords(
+                        keyframe_latent_num_frames=1,
+                        keyframe_latent_height=guide_latent.shape[3],
+                        keyframe_latent_width=guide_latent.shape[4],
+                        pixel_frame_idx=position,
+                        num_pixel_frames=1,
+                        fps=frame_rate,
+                        device=device,
+                    )
+                )
+
+            # Generated keyframe slots (`VideoGeneratedKeyframeSlots`, `keyframe_slots.py:71-174`): one empty latent
+            # frame per seam, fully denoised, at the guide's coordinates.
+            num_slot_tokens = len(seam_frame_indices) * latent_height_t * latent_width_t
+            slot_tokens = latents.new_zeros((batch_size, num_slot_tokens, latents.shape[2]))
+            latents = torch.cat([latents, slot_tokens], dim=1)
+            clean_latents = torch.cat([clean_latents, slot_tokens], dim=1)
+            conditioning_mask = torch.cat(
+                [conditioning_mask, conditioning_mask.new_zeros((batch_size, num_slot_tokens, 1))], dim=1
+            )
+            appended_coords.extend(
+                self._prepare_keyframe_coords(
+                    keyframe_latent_num_frames=1,
+                    keyframe_latent_height=latent_height,
+                    keyframe_latent_width=latent_width,
+                    pixel_frame_idx=position,
+                    num_pixel_frames=1,
+                    fps=frame_rate,
+                    device=device,
+                )
+                for position in seam_frame_indices
+            )
+            appended_coords = torch.cat(appended_coords, dim=2)
+            num_appended_tokens = latents.shape[1] - base_seq_len
 
         # The conditioning_mask values have the following semantics:
         #   - mask=0: fully noise tokens (e.g. noisy latents)
@@ -814,7 +1182,7 @@ class LTX2HDRPipeline(DiffusionPipeline, FromSingleFileMixin, LTX2LoraLoaderMixi
         scaled_mask = (1.0 - conditioning_mask) * noise_scale  # noise to initial noise level `noise_scale`
         latents = noise * scaled_mask + latents * (1 - scaled_mask)
 
-        return latents, conditioning_mask, clean_latents, appended_coords, num_ref_tokens, None
+        return latents, conditioning_mask, clean_latents, appended_coords, num_appended_tokens, None
 
     # Copied from diffusers.pipelines.ltx2.pipeline_ltx2_condition.LTX2ConditionPipeline.prepare_audio_latents
     def prepare_audio_latents(
@@ -860,13 +1228,25 @@ class LTX2HDRPipeline(DiffusionPipeline, FromSingleFileMixin, LTX2LoraLoaderMixi
         dtype: torch.dtype | None = None,
         device: torch.device | None = None,
         generator: torch.Generator | None = None,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
-        """Encode HDR IC-LoRA reference videos into `(reference_latents, reference_coords, reference_cross_mask)`.
+        input_colorspace: str | None = None,
+        high_quality_hdr: bool = False,
+        guide_frame_indices: list[int] | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None, list[torch.Tensor] | None]:
+        """Encode HDR IC-LoRA reference videos into `(reference_latents, reference_coords, reference_cross_mask,
+        guide_latents)`.
 
         Shared encoding core used by both `prepare_latents` (which folds reference tokens into the main noisy sequence)
         and the back-compat shim `prepare_reference_latents`. HDR LoRA does not currently support cross-attention
         masking for reference tokens, so the third return is always `None`.
+
+        With `hdr_transform="acescct"` the reference is mapped to ACEScct (`input_colorspace`), must cover `num_frames`
+        frames, and is encoded with the VAE in float32 (`hdr_ic_lora.py:189, 427-431` in the reference). With
+        `high_quality_hdr`, `num_frames` is the doubled `2 * N - 1` count: the first `N` source frames are each
+        repeated twice and trimmed to `num_frames` before encoding (`hdr_ic_lora.py:322-325`). `guide_frame_indices`
+        (pixel frames of that same ACEScct clip) are encoded one frame at a time by
+        [`~LTX2HDRPipeline._encode_seam_guides`] and returned, normalized, as `guide_latents`; it is `None` otherwise.
         """
+        is_sdr_to_hdr = self.hdr_video_processor.config.hdr_transform == "acescct"
         ref_height = height // reference_downscale_factor
         ref_width = width // reference_downscale_factor
 
@@ -880,6 +1260,9 @@ class LTX2HDRPipeline(DiffusionPipeline, FromSingleFileMixin, LTX2LoraLoaderMixi
 
         all_ref_latents = []
         all_ref_coords = []
+        guide_latents = None
+        # Source frames read from the reference video: `N` of the `2 * N - 1` generated in high-quality mode.
+        num_source_frames = (num_frames + 1) // 2 if high_quality_hdr else num_frames
 
         for ref_cond in reference_conditions:
             if isinstance(ref_cond.frames, PIL.Image.Image):
@@ -894,11 +1277,28 @@ class LTX2HDRPipeline(DiffusionPipeline, FromSingleFileMixin, LTX2LoraLoaderMixi
             # HDR-specific preprocessing: reflect-pad resize (vs center-crop in the standard IC-LoRA pipeline).
             # For LDR reference videos the numerical output of `preprocess_reference_video_hdr` is identical to the
             # standard [-1, 1] normalization since LogC3's `compress_ldr` is an identity clamp.
-            ref_pixels = self.hdr_video_processor.preprocess_reference_video_hdr(video_like, ref_height, ref_width)
-            ref_pixels = ref_pixels[:, :, :num_frames]
-            ref_pixels = ref_pixels.to(dtype=self.vae.dtype, device=device)
-
-            ref_latent = retrieve_latents(self.vae.encode(ref_pixels), generator=generator, sample_mode="argmax")
+            ref_pixels = self.hdr_video_processor.preprocess_reference_video_hdr(
+                video_like, ref_height, ref_width, input_colorspace=input_colorspace
+            )
+            ref_pixels = ref_pixels[:, :, :num_source_frames]
+            if is_sdr_to_hdr:
+                if ref_pixels.shape[2] < num_source_frames:
+                    raise ValueError(
+                        f"The reference video has {ref_pixels.shape[2]} frames, fewer than"
+                        f" `num_frames={num_source_frames}`."
+                    )
+                if high_quality_hdr:
+                    ref_pixels = ref_pixels.repeat_interleave(2, dim=2)[:, :, :num_frames]
+                with self._float32(self.vae):
+                    ref_pixels = ref_pixels.to(dtype=torch.float32, device=device)
+                    ref_latent = retrieve_latents(
+                        self.vae.encode(ref_pixels), generator=generator, sample_mode="argmax"
+                    )
+                    if guide_frame_indices:
+                        guide_latents = self._encode_seam_guides(ref_pixels, guide_frame_indices, dtype, device)
+            else:
+                ref_pixels = ref_pixels.to(dtype=self.vae.dtype, device=device)
+                ref_latent = retrieve_latents(self.vae.encode(ref_pixels), generator=generator, sample_mode="argmax")
             ref_latent = self._normalize_latents(ref_latent, self.vae.latents_mean, self.vae.latents_std).to(
                 device=device, dtype=dtype
             )
@@ -927,7 +1327,36 @@ class LTX2HDRPipeline(DiffusionPipeline, FromSingleFileMixin, LTX2LoraLoaderMixi
         reference_latents = torch.cat(all_ref_latents, dim=1)
         reference_coords = torch.cat(all_ref_coords, dim=2)
 
-        return reference_latents, reference_coords, None
+        return reference_latents, reference_coords, None, guide_latents
+
+    def _encode_seam_guides(
+        self,
+        pixels: torch.Tensor,
+        frame_indices: list[int],
+        dtype: torch.dtype | None = None,
+        device: torch.device | None = None,
+    ) -> list[torch.Tensor]:
+        r"""
+        VAE-encode each seam frame of an ACEScct `(1, C, F, H, W)` clip in `[-1, 1]` as a standalone one-frame clip.
+
+        Mirrors `_keyframe_conditionings_from_pixel_frames` (`hdr_ic_lora.py:109-143`): the VAE is causal, so a frame
+        encoded alone is a single "first frame" latent, unlike the same frame inside the clip. As in the reference,
+        frames larger than `SDR_TO_HDR_TILED_ENCODE_PIXEL_THRESHOLD` pixels are encoded with `tiled_encode` when VAE
+        tiling is enabled ([`AutoencoderKLLTX2Video.enable_tiling`]), and without tiling otherwise. Call it with the
+        VAE in float32. Returns one normalized `(1, C, 1, H', W')` latent per index.
+        """
+        num_frames, height, width = pixels.shape[2:]
+        use_tiled = self.vae.use_tiling and height * width > SDR_TO_HDR_TILED_ENCODE_PIXEL_THRESHOLD
+        guide_latents = []
+        for frame_index in frame_indices:
+            if not 0 <= frame_index < num_frames:
+                raise ValueError(f"Seam frame {frame_index} is outside the {num_frames}-frame reference clip.")
+            frame = pixels[:, :, frame_index : frame_index + 1]
+            moments = self.vae.tiled_encode(frame) if use_tiled else self.vae.encoder(frame)
+            latent = DiagonalGaussianDistribution(moments).mode()
+            latent = self._normalize_latents(latent, self.vae.latents_mean, self.vae.latents_std)
+            guide_latents.append(latent.to(device=device, dtype=dtype))
+        return guide_latents
 
     def prepare_reference_latents(
         self,
@@ -951,7 +1380,7 @@ class LTX2HDRPipeline(DiffusionPipeline, FromSingleFileMixin, LTX2LoraLoaderMixi
         Returns a 3-tuple `(reference_latents, reference_coords, reference_denoise_factors)` with the same shapes as
         [`LTX2InContextPipeline.prepare_reference_latents`].
         """
-        reference_latents, reference_coords, _ = self._encode_reference_conditions(
+        reference_latents, reference_coords, _, _ = self._encode_reference_conditions(
             reference_conditions=reference_conditions,
             height=height,
             width=width,
@@ -1049,6 +1478,10 @@ class LTX2HDRPipeline(DiffusionPipeline, FromSingleFileMixin, LTX2LoraLoaderMixi
         negative_prompt: str | list[str] | None = None,
         reference_conditions: LTX2HDRReferenceCondition | list[LTX2HDRReferenceCondition] | None = None,
         reference_downscale_factor: int = 1,
+        input_colorspace: str | None = None,
+        output_colorspace: str | None = None,
+        keyframe_strength: float | None = 0.95,
+        high_quality_hdr: bool = False,
         height: int = 512,
         width: int = 768,
         num_frames: int = 121,
@@ -1094,18 +1527,45 @@ class LTX2HDRPipeline(DiffusionPipeline, FromSingleFileMixin, LTX2LoraLoaderMixi
             reference_downscale_factor (`int`, *optional*, defaults to `1`):
                 Ratio between target and reference video resolutions. IC-LoRA models trained with downscaled reference
                 videos store this factor in their safetensors metadata.
+            input_colorspace (`str`, *optional*):
+                Colour space of the reference video with `hdr_transform="acescct"`: `"srgb_gamma"` (default,
+                sRGB-encoded video such as an 8-bit MP4), `"srgb"` (scene-linear Rec.709), `"acescg"` (scene-linear
+                ACEScg) or `"acescct"`. See [`~pipelines.ltx2.image_processor.to_acescct`]. Not supported with
+                `hdr_transform="logc3"`.
+            output_colorspace (`str`, *optional*):
+                Colour space of the output with `hdr_transform="acescct"`: `"rec709"` (default, scene-linear Rec.709),
+                `"acescg"` (scene-linear ACEScg) or `"acescct"` (the decoded ACEScct codes in `[0, 1]`). See
+                [`LTX2VideoHDRProcessor.postprocess_hdr_video`]. Not supported with `hdr_transform="logc3"`.
+            keyframe_strength (`float`, *optional*, defaults to `0.95`):
+                Seam keyframes of `hdr_transform="acescct"`, as the reference CLI runs them by default (its
+                `--keyframe-strength`; `None` matches `--no-keyframes`). At every seam of
+                [`~pipelines.ltx2.dfr_layout.resolve_seam_positions`], the source frame is encoded on its own and
+                appended as a guide held at this strength, next to a generated keyframe slot at the same position; the
+                slots then anchor the decode by `diffusion_decoder`. Needs a transformer with
+                `use_keyframes_abs_pos_embedding` (LTX-2.5) and a single reference video. `None` runs the plain
+                IC-LoRA. Clips without a seam (fewer than 25 frames) run the plain IC-LoRA with a warning. Ignored with
+                `hdr_transform="logc3"`.
+            high_quality_hdr (`bool`, *optional*, defaults to `False`):
+                With `hdr_transform="acescct"`: repeat every source frame, generate `2 * num_frames - 1` frames (seams
+                doubled onto that grid) and keep every second decoded frame, as the reference `--high-quality` does.
+                Reduces temporal artifacts for about twice the cost. `output_type="latent"` returns the latents of the
+                doubled clip. Not supported with `hdr_transform="logc3"`.
             height (`int`, *optional*, defaults to `512`):
-                Output video height in pixels. Must be divisible by 32.
+                Output video height in pixels. Must be divisible by 32 with `hdr_transform="logc3"`. With
+                `hdr_transform="acescct"` any height works: the reference is reflect-padded up to a multiple of the VAE
+                spatial compression ratio and the decoded video is cropped back to `height`.
             width (`int`, *optional*, defaults to `768`):
-                Output video width in pixels. Must be divisible by 32.
+                Output video width in pixels, with the same constraints as `height`.
             num_frames (`int`, *optional*, defaults to `121`):
                 Number of frames to generate. Must satisfy `(n - 1) % 8 == 0`.
             frame_rate (`float`, *optional*, defaults to `24.0`):
-                Output frame rate (used for temporal positional encoding).
+                Output frame rate (used for temporal positional encoding). With `hdr_transform="acescct"`, frame rates
+                above 30 are conditioned as 30 fps, as in the reference implementation.
             num_inference_steps (`int`, *optional*, defaults to `8`):
                 Number of denoising steps. Default matches the distilled model schedule.
             sigmas (`List[float]`, *optional*):
-                Custom sigma schedule. Overrides `num_inference_steps` when set.
+                Custom sigma schedule. Overrides `num_inference_steps` when set. With `hdr_transform="acescct"` it
+                defaults to `DISTILLED_SIGMA_VALUES` and is used as given, without a resolution-dependent shift.
             timesteps (`List[float]`, *optional*):
                 Custom timesteps schedule. Overrides `num_inference_steps` when set.
             guidance_scale (`float`, *optional*, defaults to `1.0`):
@@ -1136,10 +1596,12 @@ class LTX2HDRPipeline(DiffusionPipeline, FromSingleFileMixin, LTX2LoraLoaderMixi
                 Attention mask for `negative_prompt_embeds`.
             connector_video_embeds (`torch.Tensor`, *optional*):
                 Optional pre-computed connector outputs for the video modality. Used by the HDR LoRA pipeline; if
-                supplied, will override any `prompt`/`prompt_embeds`.
+                supplied, will override any `prompt`/`prompt_embeds`. Required with `hdr_transform="acescct"`, where a
+                2D `(sequence_length, dim)` tensor (the layout of the IC-LoRA's `video_context`) is also accepted.
             connector_audio_embeds (`torch.Tensor`, *optional*):
                 Optional pre-computed connector outputs for the audio modality. Used by the HDR LoRA pipeline; if
-                supplied, will override any `prompt`/`prompt_embeds`.
+                supplied, will override any `prompt`/`prompt_embeds`. Optional with `hdr_transform="acescct"`: the
+                audio stream is isolated from the video there, so it only feeds the discarded audio output.
             decode_timestep (`float` or `list[float]`, defaults to `0.0`):
                 VAE-decode timestep conditioning (only used by VAE configs with `timestep_conditioning=True`).
             decode_noise_scale (`float` or `list[float]`, *optional*):
@@ -1149,7 +1611,9 @@ class LTX2HDRPipeline(DiffusionPipeline, FromSingleFileMixin, LTX2LoraLoaderMixi
             output_type (`str`, *optional*, defaults to `"pt"`):
                 One of `"pt"`, `"np"`, or `"latent"`. `"pt"` returns a linear HDR torch tensor in `[0, ∞)` of shape
                 `(batch_size, num_frames, height, width, channels)`; `"np"` returns the equivalent `float32` NumPy
-                array; `"latent"` returns the raw denoised latents (skip the HDR decode).
+                array; `"latent"` returns the raw denoised latents (skip the HDR decode). With
+                `hdr_transform="acescct"` the latents cover the padded size and are not cropped, and the generated seam
+                keyframe slots are not returned.
             return_dict (`bool`, *optional*, defaults to `True`):
                 Whether to return an [`LTX2PipelineOutput`] instead of a plain tuple.
             attention_kwargs (`dict`, *optional*):
@@ -1171,22 +1635,50 @@ class LTX2HDRPipeline(DiffusionPipeline, FromSingleFileMixin, LTX2LoraLoaderMixi
         if isinstance(callback_on_step_end, (PipelineCallback, MultiPipelineCallbacks)):
             callback_on_step_end_tensor_inputs = callback_on_step_end.tensor_inputs
 
+        if reference_conditions is not None and not isinstance(reference_conditions, list):
+            reference_conditions = [reference_conditions]
+
+        # `hdr_transform="acescct"` is the LTX-2.5 SDR-To-HDR IC-LoRA (`ltx_pipelines.hdr_ic_lora.HDRICLoraPipeline`).
+        is_sdr_to_hdr = self.hdr_video_processor.config.hdr_transform == "acescct"
+
         # 1. Check inputs
-        self.check_inputs(
-            prompt=prompt,
-            height=height,
-            width=width,
-            callback_on_step_end_tensor_inputs=callback_on_step_end_tensor_inputs,
-            prompt_embeds=prompt_embeds,
-            negative_prompt_embeds=negative_prompt_embeds,
-            prompt_attention_mask=prompt_attention_mask,
-            negative_prompt_attention_mask=negative_prompt_attention_mask,
-            connector_video_embeds=connector_video_embeds,
-            connector_audio_embeds=connector_audio_embeds,
-            latents=latents,
-            spatio_temporal_guidance_blocks=spatio_temporal_guidance_blocks,
-            stg_scale=stg_scale,
-        )
+        if is_sdr_to_hdr:
+            self.check_sdr_to_hdr_inputs(
+                prompt=prompt,
+                num_frames=num_frames,
+                reference_conditions=reference_conditions,
+                callback_on_step_end_tensor_inputs=callback_on_step_end_tensor_inputs,
+                prompt_embeds=prompt_embeds,
+                negative_prompt_embeds=negative_prompt_embeds,
+                connector_video_embeds=connector_video_embeds,
+                latents=latents,
+                guidance_scale=guidance_scale,
+                stg_scale=stg_scale,
+                modality_scale=modality_scale,
+                keyframe_strength=keyframe_strength,
+            )
+        else:
+            if input_colorspace is not None or output_colorspace is not None:
+                raise ValueError(
+                    "`input_colorspace` and `output_colorspace` are only supported with `hdr_transform='acescct'`."
+                )
+            if high_quality_hdr:
+                raise ValueError("`high_quality_hdr` is only supported with `hdr_transform='acescct'`.")
+            self.check_inputs(
+                prompt=prompt,
+                height=height,
+                width=width,
+                callback_on_step_end_tensor_inputs=callback_on_step_end_tensor_inputs,
+                prompt_embeds=prompt_embeds,
+                negative_prompt_embeds=negative_prompt_embeds,
+                prompt_attention_mask=prompt_attention_mask,
+                negative_prompt_attention_mask=negative_prompt_attention_mask,
+                connector_video_embeds=connector_video_embeds,
+                connector_audio_embeds=connector_audio_embeds,
+                latents=latents,
+                spatio_temporal_guidance_blocks=spatio_temporal_guidance_blocks,
+                stg_scale=stg_scale,
+            )
 
         # Video-only guidance state.
         self._guidance_scale = guidance_scale
@@ -1199,6 +1691,12 @@ class LTX2HDRPipeline(DiffusionPipeline, FromSingleFileMixin, LTX2LoraLoaderMixi
         self._current_timestep = None
 
         # 2. Define call parameters
+        if is_sdr_to_hdr and connector_video_embeds.ndim == 2:
+            # The IC-LoRA's `video_context` is stored without a batch dimension.
+            connector_video_embeds = connector_video_embeds.unsqueeze(0)
+        if is_sdr_to_hdr and connector_audio_embeds is not None and connector_audio_embeds.ndim == 2:
+            connector_audio_embeds = connector_audio_embeds.unsqueeze(0)
+
         if prompt is not None and isinstance(prompt, str):
             batch_size = 1
         elif prompt is not None and isinstance(prompt, list):
@@ -1208,8 +1706,49 @@ class LTX2HDRPipeline(DiffusionPipeline, FromSingleFileMixin, LTX2LoraLoaderMixi
         else:
             batch_size = connector_video_embeds.shape[0]
 
-        if reference_conditions is not None and not isinstance(reference_conditions, list):
-            reference_conditions = [reference_conditions]
+        if is_sdr_to_hdr:
+            # Generate at the size rounded up to the VAE's spatial compression ratio and crop back after decoding
+            # (`align_resolution(..., ResizeMode.REFLECT_PAD, divisor=32)` and `decoded[:, :crop_h, :crop_w]` in
+            # `hdr_ic_lora.py:271-273, 520`).
+            output_height, output_width = height, width
+            height = math.ceil(height / self.vae_spatial_compression_ratio) * self.vae_spatial_compression_ratio
+            width = math.ceil(width / self.vae_spatial_compression_ratio) * self.vae_spatial_compression_ratio
+            # RoPE is conditioned on at most 30 fps (`_conditioning_fps`, `hdr_ic_lora.py:74-78`). The playback rate
+            # `frame_rate` still sizes the (discarded) audio stream.
+            conditioning_frame_rate = (
+                SDR_TO_HDR_MAX_CONDITIONING_FPS if frame_rate > SNAP_CONDITIONING_FPS_ABOVE else frame_rate
+            )
+            # The full distilled schedule, used verbatim (`DEFAULT_DENOISE_SIGMAS`, `hdr_ic_lora.py:66`).
+            if sigmas is None and timesteps is None:
+                sigmas = DISTILLED_SIGMA_VALUES
+
+            # Seam keyframes (`dfr_seam_roles`, `hdr_ic_lora.py:81-106, 284-302`): every seam gets both a guide and a
+            # generated slot. The positions are found on the source clip and doubled in high-quality mode, which
+            # generates `2 * num_frames - 1` frames from the frame-doubled source (`hdr_ic_lora.py:280-282`).
+            seam_frame_indices = []
+            if keyframe_strength is not None:
+                seam_frame_indices = resolve_seam_positions(
+                    num_frames,
+                    high_quality=high_quality_hdr,
+                    temporal_compression_ratio=self.vae_temporal_compression_ratio,
+                )
+                if not seam_frame_indices:
+                    logger.warning(
+                        f"`keyframe_strength={keyframe_strength}` but this {num_frames}-frame clip has no seam keyframes;"
+                        " running the plain IC-LoRA."
+                    )
+                elif output_type != "latent" and getattr(self, "diffusion_decoder", None) is None:
+                    logger.warning(
+                        "Seam keyframes are decoded by the keyframe-aware `diffusion_decoder`, which is not loaded:"
+                        " the generated keyframe slots still take part in denoising, but `vae` decodes the video without"
+                        " them. Load the LTX-2.5 `diffusion_decoder` to decode as the reference does, or pass"
+                        " `keyframe_strength=None`."
+                    )
+            if high_quality_hdr:
+                num_frames = 2 * num_frames - 1
+        else:
+            conditioning_frame_rate = frame_rate
+            seam_frame_indices = []
 
         if noise_scale is None:
             noise_scale = sigmas[0] if sigmas is not None else 1.0
@@ -1217,7 +1756,30 @@ class LTX2HDRPipeline(DiffusionPipeline, FromSingleFileMixin, LTX2LoraLoaderMixi
         device = self._execution_device
 
         # 3. Prepare text embeddings
-        if connector_video_embeds is None or connector_audio_embeds is None:
+        if is_sdr_to_hdr:
+            # No text encoder: the precomputed video context is the only conditioning, attended without a mask
+            # (`SimpleDenoiser(video_context, None)`, `hdr_ic_lora.py:467-485`).
+            effective_batch_size = batch_size * num_videos_per_prompt
+            connector_prompt_embeds = connector_video_embeds.to(device=device, dtype=self.transformer.dtype)
+            connector_prompt_embeds = connector_prompt_embeds.repeat_interleave(num_videos_per_prompt, dim=0)
+            if connector_audio_embeds is not None:
+                connector_audio_prompt_embeds = connector_audio_embeds.to(device=device, dtype=self.transformer.dtype)
+                connector_audio_prompt_embeds = connector_audio_prompt_embeds.repeat_interleave(
+                    num_videos_per_prompt, dim=0
+                )
+            else:
+                # The reference passes no audio context at all; with the modalities isolated this placeholder only
+                # reaches the audio stream.
+                audio_context_dim = (
+                    self.transformer.config.caption_channels
+                    if self.transformer.config.use_prompt_embeddings
+                    else self.transformer.config.audio_cross_attention_dim
+                )
+                connector_audio_prompt_embeds = torch.zeros(
+                    (effective_batch_size, 1, audio_context_dim), device=device, dtype=self.transformer.dtype
+                )
+            connector_attention_mask = None
+        elif connector_video_embeds is None or connector_audio_embeds is None:
             (
                 prompt_embeds,
                 prompt_attention_mask,
@@ -1260,7 +1822,7 @@ class LTX2HDRPipeline(DiffusionPipeline, FromSingleFileMixin, LTX2LoraLoaderMixi
             _, _, latent_num_frames, latent_height, latent_width = latents.shape
 
         num_channels_latents = self.transformer.config.in_channels
-        latents, conditioning_mask, clean_latents, appended_coords, num_ref_tokens, _ = self.prepare_latents(
+        latents, conditioning_mask, clean_latents, appended_coords, num_condition_tokens, _ = self.prepare_latents(
             reference_conditions=reference_conditions,
             reference_downscale_factor=reference_downscale_factor,
             batch_size=batch_size * num_videos_per_prompt,
@@ -1268,38 +1830,53 @@ class LTX2HDRPipeline(DiffusionPipeline, FromSingleFileMixin, LTX2LoraLoaderMixi
             height=height,
             width=width,
             num_frames=num_frames,
-            frame_rate=frame_rate,
+            frame_rate=conditioning_frame_rate,
             noise_scale=noise_scale,
             dtype=torch.float32,
             device=device,
             generator=generator,
             latents=latents,
+            input_colorspace=input_colorspace,
+            seam_frame_indices=seam_frame_indices,
+            keyframe_strength=keyframe_strength,
+            high_quality_hdr=high_quality_hdr,
         )
-        # Track the base (non-reference) token count so we can trim the appended reference tokens off
-        # `latents` before unpack/decode at the end.
-        base_token_count = latents.shape[1] - num_ref_tokens
-        if self.do_classifier_free_guidance and num_ref_tokens > 0:
+        # Track the base (non-conditioning) token count so we can trim the appended reference, guide and slot tokens
+        # off `latents` before unpack/decode at the end.
+        base_token_count = latents.shape[1] - num_condition_tokens
+        if self.do_classifier_free_guidance and num_condition_tokens > 0:
             conditioning_mask = torch.cat([conditioning_mask, conditioning_mask])
 
         # 5. Prepare audio latents. Audio is discarded at the end, but the transformer's audio branch still runs so
         # we need well-formed audio inputs. Audio guidance is fixed so no extra audio-only forward passes fire.
-        duration_s = num_frames / frame_rate
-        audio_latents_per_second = (
-            self.audio_sampling_rate / self.audio_hop_length / float(self.audio_vae_temporal_compression_ratio)
-        )
-        audio_num_frames = round(duration_s * audio_latents_per_second)
+        if is_sdr_to_hdr:
+            # The reference is video-only. The audio stream is isolated from the video below, so a single
+            # placeholder audio token is enough and does not draw from `generator`.
+            audio_num_frames = 1
+            latent_mel_bins = self.audio_mel_bins // self.audio_vae_mel_compression_ratio
+            audio_latents = torch.zeros(
+                (batch_size * num_videos_per_prompt, audio_num_frames, self.audio_latent_channels * latent_mel_bins),
+                device=device,
+                dtype=torch.float32,
+            )
+        else:
+            duration_s = num_frames / frame_rate
+            audio_latents_per_second = (
+                self.audio_sampling_rate / self.audio_hop_length / float(self.audio_vae_temporal_compression_ratio)
+            )
+            audio_num_frames = round(duration_s * audio_latents_per_second)
 
-        audio_latents = self.prepare_audio_latents(
-            batch_size * num_videos_per_prompt,
-            num_channels_latents=self.audio_latent_channels,
-            audio_latent_length=audio_num_frames,
-            num_mel_bins=self.audio_mel_bins,
-            noise_scale=noise_scale,
-            dtype=torch.float32,
-            device=device,
-            generator=generator,
-            latents=None,
-        )
+            audio_latents = self.prepare_audio_latents(
+                batch_size * num_videos_per_prompt,
+                num_channels_latents=self.audio_latent_channels,
+                audio_latent_length=audio_num_frames,
+                num_mel_bins=self.audio_mel_bins,
+                noise_scale=noise_scale,
+                dtype=torch.float32,
+                device=device,
+                generator=generator,
+                latents=None,
+            )
 
         # 6. Prepare timesteps
         sigmas = np.linspace(1.0, 1 / num_inference_steps, num_inference_steps) if sigmas is None else sigmas
@@ -1310,6 +1887,8 @@ class LTX2HDRPipeline(DiffusionPipeline, FromSingleFileMixin, LTX2LoraLoaderMixi
             self.scheduler.config.get("base_shift", 0.95),
             self.scheduler.config.get("max_shift", 2.05),
         )
+        # The SDR-To-HDR schedule is used verbatim, so no resolution-dependent shift is passed to the scheduler.
+        scheduler_kwargs = {} if is_sdr_to_hdr else {"mu": mu}
         if self.audio_scheduler is not None:
             audio_scheduler = self.audio_scheduler
         else:
@@ -1320,7 +1899,7 @@ class LTX2HDRPipeline(DiffusionPipeline, FromSingleFileMixin, LTX2LoraLoaderMixi
             device,
             timesteps,
             sigmas=sigmas,
-            mu=mu,
+            **scheduler_kwargs,
         )
         timesteps, num_inference_steps = retrieve_timesteps(
             self.scheduler,
@@ -1328,14 +1907,19 @@ class LTX2HDRPipeline(DiffusionPipeline, FromSingleFileMixin, LTX2LoraLoaderMixi
             device,
             timesteps,
             sigmas=sigmas,
-            mu=mu,
+            **scheduler_kwargs,
         )
         num_warmup_steps = max(len(timesteps) - num_inference_steps * self.scheduler.order, 0)
         self._num_timesteps = len(timesteps)
 
         # 7. Prepare positional coordinates
         video_coords = self.transformer.rope.prepare_video_coords(
-            latents.shape[0], latent_num_frames, latent_height, latent_width, latents.device, fps=frame_rate
+            latents.shape[0],
+            latent_num_frames,
+            latent_height,
+            latent_width,
+            latents.device,
+            fps=conditioning_frame_rate,
         )
         if appended_coords is not None:
             # Expand appended_coords to effective batch size (to [B, 3, num_extra_tokens, 2])
@@ -1347,6 +1931,23 @@ class LTX2HDRPipeline(DiffusionPipeline, FromSingleFileMixin, LTX2LoraLoaderMixi
         if self.do_classifier_free_guidance:
             video_coords = video_coords.repeat((2,) + (1,) * (video_coords.ndim - 1))
             audio_coords = audio_coords.repeat((2,) + (1,) * (audio_coords.ndim - 1))
+
+        # The causal VAE encodes the first latent frame from a single pixel frame. The reference marks those target
+        # tokens for the keyframe position embedding, and never the reference tokens (`_first_frame_keyframes_mask`
+        # in `ltx_core/tools.py`, `reference_video_cond.py:110-112`). Models without that embedding ignore it.
+        video_keyframes_mask = None
+        if is_sdr_to_hdr:
+            tokens_per_latent_frame = (latent_height // self.transformer_spatial_patch_size) * (
+                latent_width // self.transformer_spatial_patch_size
+            )
+            video_keyframes_mask = torch.zeros((latents.shape[0], latents.shape[1], 1), device=device)
+            video_keyframes_mask[:, :tokens_per_latent_frame] = 1.0
+            # The generated slots carry the same marker; the guides do not (`keyframe_slots.py:121`,
+            # `keyframe_cond.py:84-86`). The slots are the last tokens of the sequence.
+            num_slot_tokens = len(seam_frame_indices) * tokens_per_latent_frame
+            slot_token_slice = slice(latents.shape[1] - num_slot_tokens, latents.shape[1]) if num_slot_tokens else None
+            if slot_token_slice is not None:
+                video_keyframes_mask[:, slot_token_slice] = 1.0
 
         # 8. Denoising loop
         video_seq_len = latents.shape[1]
@@ -1366,7 +1967,7 @@ class LTX2HDRPipeline(DiffusionPipeline, FromSingleFileMixin, LTX2LoraLoaderMixi
                 audio_latent_model_input = audio_latent_model_input.to(connector_prompt_embeds.dtype)
 
                 timestep_scalar = t.expand(latent_model_input.shape[0])
-                if num_ref_tokens > 0:
+                if num_condition_tokens > 0:
                     video_timestep = timestep_scalar.unsqueeze(-1) * (1 - conditioning_mask.squeeze(-1))
                 else:
                     video_timestep = timestep_scalar.unsqueeze(-1).expand(-1, video_seq_len)
@@ -1391,15 +1992,19 @@ class LTX2HDRPipeline(DiffusionPipeline, FromSingleFileMixin, LTX2LoraLoaderMixi
                         num_frames=latent_num_frames,
                         height=latent_height,
                         width=latent_width,
-                        fps=frame_rate,
+                        fps=conditioning_frame_rate,
                         audio_num_frames=audio_num_frames,
                         video_coords=video_coords,
                         audio_coords=audio_coords,
-                        isolate_modalities=False,
+                        # The reference runs video only (`VideoAudio(video=...)`, `hdr_ic_lora.py:477-485`): turning
+                        # off the audio-to-video and video-to-audio cross-attention keeps the placeholder audio
+                        # stream out of the video.
+                        isolate_modalities=is_sdr_to_hdr,
                         spatio_temporal_guidance_blocks=None,
                         perturbation_mask=None,
                         use_cross_timestep=use_cross_timestep,
                         attention_kwargs=attention_kwargs,
+                        video_keyframes_mask=video_keyframes_mask,
                         return_dict=False,
                     )
                 noise_pred_video = noise_pred_video.float()
@@ -1420,7 +2025,7 @@ class LTX2HDRPipeline(DiffusionPipeline, FromSingleFileMixin, LTX2LoraLoaderMixi
                             video_pos_ids = video_coords.chunk(2, dim=0)[0]
                             audio_pos_ids = audio_coords.chunk(2, dim=0)[0]
                         timestep_scalar_single = timestep_scalar.chunk(2, dim=0)[0]
-                        if num_ref_tokens > 0:
+                        if num_condition_tokens > 0:
                             video_timestep_single = video_timestep.chunk(2, dim=0)[0]
                         else:
                             video_timestep_single = timestep_scalar_single.unsqueeze(-1).expand(-1, video_seq_len)
@@ -1435,13 +2040,21 @@ class LTX2HDRPipeline(DiffusionPipeline, FromSingleFileMixin, LTX2LoraLoaderMixi
                     audio_pos_ids = audio_coords
 
                     timestep_scalar_single = timestep_scalar
-                    if num_ref_tokens > 0:
+                    if num_condition_tokens > 0:
                         video_timestep_single = video_timestep
                     else:
                         video_timestep_single = timestep_scalar.unsqueeze(-1).expand(-1, video_seq_len)
                     audio_timestep_single = audio_timestep
 
-                    noise_pred_video = self.convert_velocity_to_x0(latents, noise_pred_video, i, self.scheduler)
+                    if is_sdr_to_hdr and num_condition_tokens > 0:
+                        # The reference converts the velocity with each token's own timestep, `sigma * denoise_mask`
+                        # (`to_denoised(latent, v, timesteps)`, `ltx_core/model/transformer/model.py:598`). This only
+                        # matters for the partially-clean seam guides: fully denoised tokens use `sigma`, and clean
+                        # tokens are replaced by their clean value below.
+                        token_sigmas = self.scheduler.sigmas[i] * (1 - conditioning_mask)
+                        noise_pred_video = latents - noise_pred_video * token_sigmas
+                    else:
+                        noise_pred_video = self.convert_velocity_to_x0(latents, noise_pred_video, i, self.scheduler)
 
                 # --- STG forward pass (video only — audio output discarded) ---
                 if self.do_spatio_temporal_guidance:
@@ -1529,7 +2142,7 @@ class LTX2HDRPipeline(DiffusionPipeline, FromSingleFileMixin, LTX2LoraLoaderMixi
                     noise_pred_video = noise_pred_video_g
 
                 # Apply the conditioning mask to apply the reference conditions at the specified strength.
-                if num_ref_tokens > 0:
+                if num_condition_tokens > 0:
                     bsz = noise_pred_video.size(0)
                     denoised_sample_cond = (
                         noise_pred_video * (1 - conditioning_mask[:bsz])
@@ -1561,7 +2174,13 @@ class LTX2HDRPipeline(DiffusionPipeline, FromSingleFileMixin, LTX2LoraLoaderMixi
                     xm.mark_step()
 
         # 9. Decode
-        # Trim any appended reference tokens from the latents to recover the generated video only.
+        # The generated seam keyframe slots, `(B, C, num_seams, H, W)` (`clear_conditioning`, `ltx_core/tools.py:88-117`).
+        slot_latents = None
+        if seam_frame_indices:
+            _, slot_latents = self._unpack_video_and_slots(
+                latents, num_frames, height, width, slot_token_slice, len(seam_frame_indices)
+            )
+        # Trim the appended reference, guide and slot tokens from the latents to recover the generated video only.
         latents = latents[:, :base_token_count]
         latents = self._unpack_latents(
             latents,
@@ -1578,7 +2197,8 @@ class LTX2HDRPipeline(DiffusionPipeline, FromSingleFileMixin, LTX2LoraLoaderMixi
             )
             video = latents
         else:
-            latents = latents.to(connector_prompt_embeds.dtype)
+            # The SDR-To-HDR reference decodes in float32 (`vae_dtype`, `hdr_ic_lora.py:189, 512-518`).
+            latents = latents.to(torch.float32 if is_sdr_to_hdr else connector_prompt_embeds.dtype)
 
             if not self.vae.config.timestep_conditioning:
                 timestep = None
@@ -1600,12 +2220,47 @@ class LTX2HDRPipeline(DiffusionPipeline, FromSingleFileMixin, LTX2LoraLoaderMixi
             latents = self._denormalize_latents(
                 latents, self.vae.latents_mean, self.vae.latents_std, self.vae.config.scaling_factor
             )
-            latents = latents.to(self.vae.dtype)
+            if is_sdr_to_hdr:
+                # Decoded ACEScct codes in [-1, 1], cropped back to the requested size.
+                diffusion_decoder = getattr(self, "diffusion_decoder", None)
+                keyframe_kwargs = {}
+                if slot_latents is not None:
+                    # `decode_keyframes_from_slots` (`ltx_pipelines/utils/helpers.py:539-559`): keep the slots that land
+                    # inside the generated clip (all of them here, the seams are clipped to it), denormalized like the
+                    # video, at their pixel frames.
+                    kept = [(index, p) for index, p in enumerate(seam_frame_indices) if 0 <= p < num_frames]
+                    slot_latents = self._denormalize_latents(
+                        slot_latents[:, :, [index for index, _ in kept]].to(torch.float32),
+                        self.vae.latents_mean,
+                        self.vae.latents_std,
+                        self.vae.config.scaling_factor,
+                    )
+                    keyframe_kwargs = {
+                        "keyframe_latents": slot_latents,
+                        "keyframe_frame_indices": torch.tensor([p for _, p in kept], dtype=torch.long),
+                    }
+                if diffusion_decoder is not None:
+                    with self._float32(diffusion_decoder):
+                        decoded = diffusion_decoder.decode(
+                            latents, generator=generator, return_dict=False, **keyframe_kwargs
+                        )[0]
+                else:
+                    # The VAE cannot take keyframe planes; the slots only shaped the denoising (warned above).
+                    with self._float32(self.vae):
+                        decoded = self.vae.decode(latents, timestep, return_dict=False)[0]
+                decoded = decoded[:, :, :, :output_height, :output_width]
+                if high_quality_hdr:
+                    # Undo the frame doubling (`decoded[::2]`, `hdr_ic_lora.py:521-522`).
+                    decoded = decoded[:, :, ::2]
+            else:
+                latents = latents.to(self.vae.dtype)
 
-            # VAE decode returns a video tensor in the VAE's native range ([-1, 1]).
-            decoded = self.vae.decode(latents, timestep, return_dict=False)[0]
-            # HDR postprocess: LogC3 decompress → linear HDR [0, ∞). Always float32 for HDR fidelity.
-            video = self.hdr_video_processor.postprocess_hdr_video(decoded, output_type=output_type)
+                # VAE decode returns a video tensor in the VAE's native range ([-1, 1]).
+                decoded = self.vae.decode(latents, timestep, return_dict=False)[0]
+            # HDR postprocess: LogC3 or ACEScct decompress → linear HDR [0, ∞). Always float32 for HDR fidelity.
+            video = self.hdr_video_processor.postprocess_hdr_video(
+                decoded, output_type=output_type, output_colorspace=output_colorspace
+            )
 
         # Audio is always None for this video-only pipeline.
         self.maybe_free_model_hooks()

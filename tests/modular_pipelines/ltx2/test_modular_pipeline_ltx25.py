@@ -13,8 +13,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import functools
-
 import numpy as np
 import PIL.Image
 import pytest
@@ -185,44 +183,27 @@ class TestLTX25Text2VideoModularPipelineFast(
         assert (num_frames - 1) % pipe.vae_temporal_compression_ratio == 0
         assert 0 < num_frames <= round(2.0 * inputs["frame_rate"])
 
-    def test_conditioning_frame_rate_rescales_only_the_video_time_axis(self):
+    def test_motion_speed_rescales_only_the_video_time_axis(self):
         pipe = self.get_pipeline().to("cpu")
-        frame_rate = self.get_dummy_inputs()["frame_rate"]
-        forward = pipe.transformer.forward
+        outputs = ["videos", "audio", "video_coords", "audio_coords"]
 
-        def run(**overrides):
-            calls = []
-
-            @functools.wraps(forward)  # keeps the signature the modular loop filters kwargs by
-            def recording_forward(*args, **kwargs):
-                calls.append(
-                    {
-                        "video_coords": kwargs["video_coords"].clone(),
-                        "audio_tokens": kwargs["audio_hidden_states"].shape[1],
-                    }
-                )
-                return forward(*args, **kwargs)
-
-            pipe.transformer.forward = recording_forward
-            try:
-                output = pipe(**{**self.get_dummy_inputs(), **overrides}, output=["videos", "audio"])
-            finally:
-                pipe.transformer.forward = forward
-            return output, calls
-
-        default, default_calls = run()
-        same, _ = run(conditioning_frame_rate=frame_rate)
-        slow, slow_calls = run(conditioning_frame_rate=2 * frame_rate)
+        default = pipe(**self.get_dummy_inputs(), output=outputs)
+        same = pipe(**self.get_dummy_inputs(), motion_speed=1.0, output=outputs)
+        slow = pipe(**self.get_dummy_inputs(), motion_speed=0.5, output=outputs)
 
         assert_tensors_close(same["videos"], default["videos"], atol=1e-6, rtol=0)
-
-        default_coords, slow_coords = default_calls[0]["video_coords"], slow_calls[0]["video_coords"]
-        assert_tensors_close(slow_coords[:, 0], default_coords[:, 0] / 2, atol=1e-6, rtol=1e-6)
-        assert torch.equal(slow_coords[:, 1:], default_coords[:, 1:])
-        assert slow_calls[0]["audio_tokens"] == default_calls[0]["audio_tokens"]
+        # Half speed doubles the conditioning rate: the time axis of the video positions halves, nothing else moves.
+        assert_tensors_close(slow["video_coords"][:, 0], default["video_coords"][:, 0] / 2, atol=1e-6, rtol=1e-6)
+        assert torch.equal(slow["video_coords"][:, 1:], default["video_coords"][:, 1:])
+        assert torch.equal(slow["audio_coords"], default["audio_coords"])
         assert slow["videos"].shape == default["videos"].shape
         assert slow["audio"].shape == default["audio"].shape
         assert not torch.allclose(slow["videos"], default["videos"])
+
+    def test_motion_speed_must_be_positive(self):
+        pipe = self.get_pipeline().to("cpu")
+        with pytest.raises(ValueError, match="motion_speed"):
+            pipe(**self.get_dummy_inputs(), motion_speed=0.0, output="videos")
 
 
 class TestLTX25Text2VideoModularPipelineLoading(LTX25Text2VideoModularPipelineTesterConfig, ModularLoadingTesterMixin):

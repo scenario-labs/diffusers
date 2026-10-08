@@ -12,8 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import functools
-
 import pytest
 import torch
 
@@ -246,51 +244,35 @@ class TestLTX2Pipeline(LTX2PipelineTesterConfig, PipelineTesterMixin):
         with pytest.raises(ValueError, match="min_seconds"):
             pipe(**inputs)
 
-    def _run_recording_transformer_inputs(self, pipe, **overrides):
-        calls = []
-        forward = pipe.transformer.forward
-
-        @functools.wraps(forward)  # keeps the signature the modular loop filters kwargs by
-        def recording_forward(*args, **kwargs):
-            calls.append(
-                {
-                    "video_coords": kwargs["video_coords"].clone(),
-                    "audio_tokens": kwargs["audio_hidden_states"].shape[1],
-                    "fps": kwargs["fps"],
-                }
-            )
-            return forward(*args, **kwargs)
-
-        pipe.transformer.forward = recording_forward
-        try:
-            output = pipe(**{**self.get_dummy_inputs(), **overrides})
-        finally:
-            pipe.transformer.forward = forward
-        return output, calls
-
-    def test_conditioning_frame_rate_rescales_only_the_video_time_axis(self):
+    def test_motion_speed_changes_the_video_only(self):
         pipe = self.get_pipeline()
-        frame_rate = self.get_dummy_inputs()["frame_rate"]
 
-        default, default_calls = self._run_recording_transformer_inputs(pipe)
-        same, _ = self._run_recording_transformer_inputs(pipe, conditioning_frame_rate=frame_rate)
-        slow, slow_calls = self._run_recording_transformer_inputs(pipe, conditioning_frame_rate=2 * frame_rate)
+        default = pipe(**self.get_dummy_inputs())
+        same = pipe(**{**self.get_dummy_inputs(), "motion_speed": 1.0})
+        slow = pipe(**{**self.get_dummy_inputs(), "motion_speed": 0.5})
 
-        # Defaulting to `frame_rate` leaves the pipeline unchanged.
+        # The default speed of 1 leaves the pipeline unchanged.
         assert_tensors_close(same.frames, default.frames, atol=1e-6, rtol=0)
         assert_tensors_close(same.audio, default.audio, atol=1e-6, rtol=0)
-
-        # A doubled conditioning rate halves the time axis of the video positions and nothing else.
-        default_coords, slow_coords = default_calls[0]["video_coords"], slow_calls[0]["video_coords"]
-        assert_tensors_close(slow_coords[:, 0], default_coords[:, 0] / 2, atol=1e-6, rtol=1e-6)
-        assert torch.equal(slow_coords[:, 1:], default_coords[:, 1:])
-        assert all(call["fps"] == 2 * frame_rate for call in slow_calls)
-
-        # Audio length and the output shapes keep following the playback `frame_rate`.
-        assert slow_calls[0]["audio_tokens"] == default_calls[0]["audio_tokens"]
+        # A different speed changes the video, not the output shapes or the audio length.
         assert slow.frames.shape == default.frames.shape
         assert slow.audio.shape == default.audio.shape
         assert not torch.allclose(slow.frames, default.frames)
+
+    def test_duration_head_follows_frame_rate_not_motion_speed(self):
+        pipe = self.get_pipeline_with_duration_head()
+        inputs = self.get_dummy_inputs()
+        inputs.pop("num_frames")
+        inputs.update(min_seconds=1.0, max_seconds=2.0)
+
+        default = pipe(**inputs).frames
+        slow = pipe(**{**inputs, "motion_speed": 0.2}).frames
+        assert slow.shape[1] == default.shape[1]
+
+    def test_motion_speed_must_be_positive(self):
+        pipe = self.get_pipeline()
+        with pytest.raises(ValueError, match="motion_speed"):
+            pipe(**{**self.get_dummy_inputs(), "motion_speed": 0.0})
 
 
 class TestLTX2PipelineMemory(LTX2PipelineTesterConfig, LTX2MemoryTesterMixin):

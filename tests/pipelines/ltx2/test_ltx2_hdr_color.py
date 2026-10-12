@@ -460,6 +460,18 @@ class TestEXR:
                 assert channels[name].shape == (6, 10)
                 np.testing.assert_array_equal(channels[name], frame[..., index].numpy().astype(np.float16))
 
+    @pytest.mark.parametrize("frame_rate, expected", [(None, None), (24, (24, 1)), (29.97, (2997, 100))])
+    def test_export_sequence_frame_rate(self, tmp_path, frame_rate, expected):
+        frames = torch.ones(2, 4, 4, 3)
+        paths = self.export_utils.export_to_exr_sequence(frames, tmp_path / "exr", frame_rate=frame_rate)
+        for path in paths:
+            header, _ = self._read(path)
+            if expected is None:
+                assert "framesPerSecond" not in header
+            else:
+                fps = header["framesPerSecond"]
+                assert (fps.numerator, fps.denominator) == expected
+
     def test_save_frame_channels_first_and_full_float(self, tmp_path):
         frame = torch.arange(3 * 4 * 2, dtype=torch.float32).reshape(3, 4, 2) * 1e3  # (C, H, W)
         self.export_utils.save_exr_frame(frame, tmp_path / "frame.exr", primaries="acescg", half=False)

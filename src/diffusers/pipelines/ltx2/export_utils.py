@@ -353,11 +353,12 @@ def save_exr_frame(
     primaries: str = "rec709",
     color_space: str = "sRGB",
     half: bool = True,
+    frame_rate: float | None = None,
 ) -> None:
     r"""
     Saves a single RGB frame as an OpenEXR file tagged with its colour space, following the LTX-2 reference EXR writer:
     a scanline image with `R`, `G` and `B` channels, ZIP compression, and `chromaticities` and `colorSpace` header
-    attributes.
+    attributes, plus the standard `framesPerSecond` attribute when `frame_rate` is given.
 
     Requires the `OpenEXR` package (`pip install OpenEXR`, version 3.3 or later).
 
@@ -373,6 +374,9 @@ def save_exr_frame(
             scene-linear values, `"ACEScct"` for log codes).
         half (`bool`, *optional*, defaults to `True`):
             Write 16-bit half floats. When `False`, 32-bit floats are written, unless `frame` is already float16.
+        frame_rate (`float`, *optional*):
+            Frame rate of the sequence the frame belongs to, written to the `framesPerSecond` rational attribute (the
+            same rational as the MP4 exporters, e.g. `24/1` or `2997/100`). Not written when `None`.
     """
     OpenEXR = _import_openexr()
     if primaries not in _EXR_CHROMATICITIES:
@@ -396,6 +400,8 @@ def save_exr_frame(
         "chromaticities": _EXR_CHROMATICITIES[primaries],
         "colorSpace": color_space,
     }
+    if frame_rate is not None:
+        header["framesPerSecond"] = Fraction(frame_rate).limit_denominator(1000)
     channels = {name: np.ascontiguousarray(frame[..., index]) for index, name in enumerate("RGB")}
     with OpenEXR.File(header, channels) as exr_file:
         exr_file.write(str(output_exr))
@@ -406,6 +412,7 @@ def export_to_exr_sequence(
     output_dir: str | Path,
     exr_colorspace: str = "acescg",
     half: bool = True,
+    frame_rate: float | None = None,
 ) -> list[str]:
     r"""
     Saves HDR frames as a directory of OpenEXR files named `frame_00000.exr`, `frame_00001.exr`, ..., following the
@@ -425,6 +432,9 @@ def export_to_exr_sequence(
             or `"acescct"` (ACEScct codes, AP1 chromaticities, `colorSpace="ACEScct"`).
         half (`bool`, *optional*, defaults to `True`):
             Write 16-bit half floats.
+        frame_rate (`float`, *optional*):
+            Frame rate of the sequence, written to every frame's `framesPerSecond` attribute. Not written when
+            `None`.
 
     Returns:
         `list[str]`: Paths of the written EXR files.
@@ -441,6 +451,6 @@ def export_to_exr_sequence(
     paths = []
     for index, frame in enumerate(frames):
         path = output_dir / f"frame_{index:05d}.exr"
-        save_exr_frame(frame, path, primaries=primaries, color_space=color_space, half=half)
+        save_exr_frame(frame, path, primaries=primaries, color_space=color_space, half=half, frame_rate=frame_rate)
         paths.append(str(path))
     return paths
